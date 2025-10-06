@@ -197,25 +197,14 @@ int clean_userdb_files() {
 /**
  * 发送清理结果通知
  */
-// void send_clean_msg(const int& deleteItemCount) {
-// #if defined(_WIN32) || defined(_WIN64)
-//   auto content = L"用户词典共清理  行无效词条";
-//   std::wstring str = content;
-//   std::wstringstream wss;
-//   wss << deleteItemCount;
-//   str.insert(8, wss.str());
-//   MessageBoxW(NULL, str.c_str(), L"通知", MB_OK);
-// #elif __APPLE__
-// #elif __linux__
-// #endif
-// }
-
 void send_clean_msg(const int& deleteItemCount) {
 #if defined(_WIN32) || defined(_WIN64)
+  auto content = L"用户词典共清理  行无效词条";
+  std::wstring str = content;
   std::wstringstream wss;
-  wss << L"用户词典共清理 " << deleteItemCount << L" 行无效词条";
-  
-  MessageBoxW(NULL, wss.str().c_str(), L"通知", MB_OK);
+  wss << deleteItemCount;
+  str.insert(8, wss.str());
+  MessageBoxW(NULL, str.c_str(), L"通知", MB_OK);
 #elif __APPLE__
 #elif __linux__
 #endif
