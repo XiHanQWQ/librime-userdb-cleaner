@@ -1,18 +1,24 @@
-#ifndef USERDB_SYNC_DELETE_HPP_
-#define USERDB_SYNC_DELETE_HPP_
+#ifndef USERDB_CLEANER_HPP_
+#define USERDB_CLEANER_HPP_
 
 #include <rime/common.h>
 #include <rime/processor.h>
+#include <rime/config.h>
 
 namespace rime {
 
-class UserdbSyncDelete : public Processor {
+class UserdbCleaner : public Processor {
  public:
-  explicit UserdbSyncDelete(const Ticket& ticket) : Processor(ticket) {};
+  explicit UserdbCleaner(const Ticket& ticket);
+  ~UserdbCleaner();
 
   ProcessResult ProcessKeyEvent(const KeyEvent& key_event) override;
+
+ private:
+  void InitializeConfig();
+  std::string trigger_input_ = "/del";  // 默认触发输入
+  bool enabled_ = true;                 // 是否启用
 };
 
 }  // namespace rime
 #endif
-
