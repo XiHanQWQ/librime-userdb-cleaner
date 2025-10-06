@@ -3,6 +3,7 @@
 #include <rime/context.h>
 #include <rime/engine.h>
 #include <rime/key_event.h>
+#include <rime/schema.h>
 #include <rime_api.h>
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -38,19 +39,23 @@ void UserdbCleaner::InitializeConfig() {
     return;
   }
   
-  if (auto schema = engine_->schema()) {
-    if (auto config = schema->config()) {
-      // 读取触发输入配置
-      if (!config->GetString("userdb_cleaner/trigger_input", &trigger_input_)) {
-        LOG(INFO) << "userdb_cleaner/trigger_input not set, using default: " << trigger_input_;
-      } else {
-        LOG(INFO) << "UserdbCleaner trigger_input: " << trigger_input_;
-      }
-    } else {
-      LOG(ERROR) << "Failed to get config in UserdbCleaner";
-    }
-  } else {
+  Schema* schema = engine_->schema();
+  if (!schema) {
     LOG(ERROR) << "Failed to get schema in UserdbCleaner";
+    return;
+  }
+  
+  Config* config = schema->config();
+  if (!config) {
+    LOG(ERROR) << "Failed to get config in UserdbCleaner";
+    return;
+  }
+
+  // 读取触发输入配置
+  if (!config->GetString("userdb_cleaner/trigger_input", &trigger_input_)) {
+    LOG(INFO) << "userdb_cleaner/trigger_input not set, using default: " << trigger_input_;
+  } else {
+    LOG(INFO) << "UserdbCleaner trigger_input: " << trigger_input_;
   }
 }
 
@@ -311,7 +316,7 @@ ProcessResult UserdbCleaner::ProcessKeyEvent(const KeyEvent& key_event) {
     ctx->Clear();
     LOG(INFO) << "UserdbCleaner triggered by input: " << trigger_input_;
     
-    // 启动一个线程来执行清理任务, 避免系统等待用户关闭窗口导致系统阻塞
+    // 启动一个线程来执行清理任务
     DetachedThreadManager manager;
     if (manager.try_start(process_clean_task)) {
       LOG(INFO) << "UserdbCleaner task started successfully";
