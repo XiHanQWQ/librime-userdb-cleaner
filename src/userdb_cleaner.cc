@@ -280,14 +280,15 @@ int clean_userdb_files() {
  */
 void send_clean_msg(const int& delete_item_count) {
 #if defined(_WIN32) || defined(_WIN64)
-  auto content = L"用户词典共清理  行无效词条";
-  std::wstring str = content;
   std::wstringstream wss;
-  wss << delete_item_count;
-  str.insert(8, wss.str());
-  MessageBoxW(NULL, str.c_str(), L"通知", MB_OK);
+  wss << L"User dictionary cleaning completed.\n";
+  wss << L"Deleted " << delete_item_count << L" invalid entries.";
+  
+  MessageBoxW(NULL, wss.str().c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
 #elif __APPLE__
+  // macOS 通知实现
 #elif __linux__
+  // Linux 通知实现
 #endif
 }
 
