@@ -15,7 +15,7 @@
 #include <string>
 #include <windows.h>
 #include <vector>
-#include <process.h>
+#include <cstdlib>  // 用于 system 函数
 #endif
 
 #include "lib/detached_thread_manager.hpp"
@@ -60,79 +60,35 @@ void UserdbCleaner::InitializeConfig() {
   }
 }
 
-/**
- * 执行外部程序
- */
-bool execute_deployer(const std::string& argument) {
 #if defined(_WIN32) || defined(_WIN64)
-  // 使用 get_shared_data_dir 获取程序安装目录
-  const char* shared_data_dir = rime_get_api()->get_shared_data_dir();
-  if (!shared_data_dir) {
-    LOG(ERROR) << "Failed to get shared data directory";
-    return false;
-  }
+/**
+ * 执行 WeaselDeployer 命令
+ */
+bool execute_weasel_deployer(const std::string& argument) {
+  // 获取共享数据目录（程序目录）
+  char shared_data_dir[1024] = {0};
+  rime_get_api()->get_shared_data_dir_s(shared_data_dir, sizeof(shared_data_dir));
   
-  // 构建 WeaselDeployer.exe 路径
-  fs::path shared_path(shared_data_dir);
-  fs::path install_dir = shared_path.parent_path(); // 安装目录
-  fs::path deployer_path = install_dir / "WeaselDeployer.exe";
+  fs::path deployer_path = fs::path(shared_data_dir) / "WeaselDeployer.exe";
   
   if (!fs::exists(deployer_path)) {
     LOG(ERROR) << "WeaselDeployer.exe not found at: " << deployer_path.string();
     return false;
   }
   
-  // 构建命令行
   std::string command = "\"" + deployer_path.string() + "\" " + argument;
-  
   LOG(INFO) << "Executing: " << command;
   
-  // 使用 CreateProcess 执行程序
-  STARTUPINFOA si = {0};
-  PROCESS_INFORMATION pi = {0};
-  si.cb = sizeof(si);
-  
-  // 创建可写的命令行字符串
-  char* cmd_line = _strdup(command.c_str());
-  
-  BOOL success = CreateProcessA(
-    NULL,           // 应用程序名（使用命令行）
-    cmd_line,       // 命令行
-    NULL,           // 进程安全属性
-    NULL,           // 线程安全属性
-    FALSE,          // 不继承句柄
-    0,              // 创建标志
-    NULL,           // 环境块
-    NULL,           // 当前目录
-    &si,            // STARTUPINFO
-    &pi             // PROCESS_INFORMATION
-  );
-  
-  free(cmd_line);
-  
-  if (success) {
-    // 等待进程结束（最多等待10秒）
-    DWORD wait_result = WaitForSingleObject(pi.hProcess, 10000);
-    if (wait_result == WAIT_TIMEOUT) {
-      LOG(WARNING) << "WeaselDeployer timed out, terminating...";
-      TerminateProcess(pi.hProcess, 1);
-    }
-    
-    DWORD exit_code;
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-    LOG(INFO) << "WeaselDeployer exited with code: " << exit_code;
-    
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return exit_code == 0;
-  } else {
-    LOG(ERROR) << "Failed to execute WeaselDeployer. Error: " << GetLastError();
+  int result = std::system(command.c_str());
+  if (result != 0) {
+    LOG(ERROR) << "WeaselDeployer execution failed with code: " << result;
     return false;
   }
-#else
+  
+  LOG(INFO) << "WeaselDeployer executed successfully: " << argument;
   return true;
-#endif
 }
+#endif
 
 /**
  * 获取目录下所有的 .userdb 文件夹
@@ -175,7 +131,10 @@ std::vector<fs::path> get_userdb_folders(const fs::path& dir) {
  * 清理用户目录下的 .userdb 文件夹
  */
 int clean_userdb_folders() {
-  auto user_data_dir = rime_get_api()->get_user_data_dir();
+  // 使用 get_user_data_dir_s 获取用户数据目录
+  char user_data_dir[1024] = {0};
+  rime_get_api()->get_user_data_dir_s(user_data_dir, sizeof(user_data_dir));
+  
   LOG(INFO) << "Cleaning userdb folders in: " << user_data_dir;
   
   auto folders = get_userdb_folders(user_data_dir);
@@ -206,24 +165,20 @@ int clean_userdb_folders() {
 std::vector<fs::path> get_userdb_files() {
   std::vector<fs::path> result;
 
-  // 使用 get_sync_dir 获取同步目录
-  const char* sync_dir_cstr = rime_get_api()->get_sync_dir();
-  if (!sync_dir_cstr) {
-    LOG(ERROR) << "Failed to get sync directory";
-    return result;
-  }
-  fs::path sync_dir(sync_dir_cstr);
+  // 使用 get_sync_dir_s 获取 sync 目录
+  char sync_dir[1024] = {0};
+  rime_get_api()->get_sync_dir_s(sync_dir, sizeof(sync_dir));
+  
+  fs::path sync_path(sync_dir);
+  LOG(INFO) << "Scanning for userdb files in: " << sync_path.string();
 
-  LOG(INFO) << "Scanning for userdb files in sync directory: " << sync_dir.string();
-
-  if (!fs::exists(sync_dir) || !fs::is_directory(sync_dir)) {
-    LOG(ERROR) << "Sync directory does not exist: " << sync_dir.string();
+  if (!fs::exists(sync_path) || !fs::is_directory(sync_path)) {
+    LOG(ERROR) << "Sync directory does not exist: " << sync_path.string();
     return result;
   }
 
   int file_count = 0;
-  // 直接在 sync 目录中查找 .userdb.txt 文件
-  for (const auto& entry : fs::directory_iterator(sync_dir)) {
+  for (const auto& entry : fs::directory_iterator(sync_path)) {
     try {
       if (entry.is_regular_file()) {
         const auto& path = entry.path();
@@ -360,28 +315,23 @@ void send_clean_msg(const int& delete_item_count) {
 void process_clean_task() {
   LOG(INFO) << "Starting userdb cleaning task...";
   
-  // 清理前触发部署
-  LOG(INFO) << "Triggering deployment before cleaning...";
-  if (!execute_deployer("/deploy")) {
-    LOG(ERROR) << "Pre-cleaning deployment failed";
-  }
+#if defined(_WIN32) || defined(_WIN64)
+  // 清理前先执行 deploy 和 sync
+  LOG(INFO) << "Executing pre-clean deployment...";
+  execute_weasel_deployer("/deploy");
+  execute_weasel_deployer("/sync");
+#endif
   
-  // 清理前同步
-  LOG(INFO) << "Triggering sync before cleaning...";
-  if (!execute_deployer("/sync")) {
-    LOG(ERROR) << "Pre-cleaning sync failed";
-  }
-  
-  // 执行清理
   int folder_deleted_count = clean_userdb_folders();
   int file_deleted_count = clean_userdb_files();
   int total_deleted_count = folder_deleted_count + file_deleted_count;
   
-  // 清理后同步
-  LOG(INFO) << "Triggering sync after cleaning...";
-  if (!execute_deployer("/sync")) {
-    LOG(ERROR) << "Post-cleaning sync failed";
-  }
+#if defined(_WIN32) || defined(_WIN64)
+  // 清理后执行 sync 和 deploy
+  LOG(INFO) << "Executing post-clean deployment...";
+  execute_weasel_deployer("/sync");
+  execute_weasel_deployer("/deploy");
+#endif
   
   LOG(INFO) << "Userdb cleaning completed. Total deleted entries: " << total_deleted_count;
   send_clean_msg(total_deleted_count);
