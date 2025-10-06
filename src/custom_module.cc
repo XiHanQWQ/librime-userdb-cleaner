@@ -2,13 +2,13 @@
 #include <rime/registry.h>
 #include <rime_api.h>
 
-#include "userdb_sync_delete.hpp"
+#include "userdb_cleaner.hpp"
 
 namespace rime {
 
 static void rime_custom_initialize() {
   Registry& r = Registry::instance();
-  r.Register("userdb_sync_delete", new Component<UserdbSyncDelete>);
+  r.Register("userdb_cleaner", new Component<UserdbCleaner>);
 }
 
 static void rime_custom_finalize() {}
