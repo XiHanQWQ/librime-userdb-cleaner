@@ -15,6 +15,7 @@
 #include <string>
 #include <windows.h>
 #include <vector>
+#include <process.h>
 #endif
 
 #include "lib/detached_thread_manager.hpp"
@@ -57,6 +58,77 @@ void UserdbCleaner::InitializeConfig() {
   } else {
     LOG(INFO) << "UserdbCleaner trigger_input: " << trigger_input_;
   }
+}
+
+/**
+ * 执行外部程序
+ */
+bool execute_deployer(const std::string& argument) {
+#if defined(_WIN32) || defined(_WIN64)
+  // 获取共享数据目录（程序安装目录）
+  char shared_data_dir[1024] = {0};
+  rime_get_api()->get_shared_data_dir_s(shared_data_dir, sizeof(shared_data_dir));
+  
+  // 构建 WeaselDeployer.exe 路径
+  fs::path shared_path(shared_data_dir);
+  fs::path install_dir = shared_path.parent_path(); // 安装目录
+  fs::path deployer_path = install_dir / "WeaselDeployer.exe";
+  
+  if (!fs::exists(deployer_path)) {
+    LOG(ERROR) << "WeaselDeployer.exe not found at: " << deployer_path.string();
+    return false;
+  }
+  
+  // 构建命令行
+  std::string command = "\"" + deployer_path.string() + "\" " + argument;
+  
+  LOG(INFO) << "Executing: " << command;
+  
+  // 使用 CreateProcess 执行程序
+  STARTUPINFOA si = {0};
+  PROCESS_INFORMATION pi = {0};
+  si.cb = sizeof(si);
+  
+  // 创建可写的命令行字符串
+  char* cmd_line = _strdup(command.c_str());
+  
+  BOOL success = CreateProcessA(
+    NULL,           // 应用程序名（使用命令行）
+    cmd_line,       // 命令行
+    NULL,           // 进程安全属性
+    NULL,           // 线程安全属性
+    FALSE,          // 不继承句柄
+    0,              // 创建标志
+    NULL,           // 环境块
+    NULL,           // 当前目录
+    &si,            // STARTUPINFO
+    &pi             // PROCESS_INFORMATION
+  );
+  
+  free(cmd_line);
+  
+  if (success) {
+    // 等待进程结束（最多等待10秒）
+    DWORD wait_result = WaitForSingleObject(pi.hProcess, 10000);
+    if (wait_result == WAIT_TIMEOUT) {
+      LOG(WARNING) << "WeaselDeployer timed out, terminating...";
+      TerminateProcess(pi.hProcess, 1);
+    }
+    
+    DWORD exit_code;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    LOG(INFO) << "WeaselDeployer exited with code: " << exit_code;
+    
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return exit_code == 0;
+  } else {
+    LOG(ERROR) << "Failed to execute WeaselDeployer. Error: " << GetLastError();
+    return false;
+  }
+#else
+  return true;
+#endif
 }
 
 /**
@@ -131,31 +203,12 @@ int clean_userdb_folders() {
 std::vector<fs::path> get_userdb_files() {
   std::vector<fs::path> result;
 
-  auto dir = fs::path(rime_get_api()->get_user_data_dir());
-  if (!fs::is_directory(dir) || !fs::exists(dir)) {
-    LOG(ERROR) << "User data directory does not exist: " << dir.string();
-    return result;
-  }
-  
-  auto inst_file = dir / "installation.yaml";
-  auto sync_dir = dir / "sync";
-  Config config;
-  std::string installation_id;
-  
-  if (config.LoadFromFile(inst_file)) {
-    config.GetString("installation_id", &installation_id);
-  } else {
-    LOG(ERROR) << "Failed to load installation.yaml";
-    return result;
-  }
+  // 使用 get_sync_dir 获取同步目录
+  char sync_dir_buffer[1024] = {0};
+  rime_get_api()->get_sync_dir(sync_dir_buffer, sizeof(sync_dir_buffer));
+  fs::path sync_dir(sync_dir_buffer);
 
-  if (installation_id.empty()) {
-    LOG(ERROR) << "Installation ID is empty";
-    return result;
-  }
-  
-  sync_dir = sync_dir / installation_id;
-  LOG(INFO) << "Scanning for userdb files in: " << sync_dir.string();
+  LOG(INFO) << "Scanning for userdb files in sync directory: " << sync_dir.string();
 
   if (!fs::exists(sync_dir) || !fs::is_directory(sync_dir)) {
     LOG(ERROR) << "Sync directory does not exist: " << sync_dir.string();
@@ -163,6 +216,7 @@ std::vector<fs::path> get_userdb_files() {
   }
 
   int file_count = 0;
+  // 直接在 sync 目录中查找 .userdb.txt 文件
   for (const auto& entry : fs::directory_iterator(sync_dir)) {
     try {
       if (entry.is_regular_file()) {
@@ -287,8 +341,10 @@ void send_clean_msg(const int& delete_item_count) {
   MessageBoxW(NULL, wss.str().c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
 #elif __APPLE__
   // macOS 通知实现
+  LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
 #elif __linux__
   // Linux 通知实现
+  LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
 #endif
 }
 
@@ -298,9 +354,28 @@ void send_clean_msg(const int& delete_item_count) {
 void process_clean_task() {
   LOG(INFO) << "Starting userdb cleaning task...";
   
+  // 清理前触发部署
+  LOG(INFO) << "Triggering deployment before cleaning...";
+  if (!execute_deployer("/deploy")) {
+    LOG(ERROR) << "Pre-cleaning deployment failed";
+  }
+  
+  // 清理前同步
+  LOG(INFO) << "Triggering sync before cleaning...";
+  if (!execute_deployer("/sync")) {
+    LOG(ERROR) << "Pre-cleaning sync failed";
+  }
+  
+  // 执行清理
   int folder_deleted_count = clean_userdb_folders();
   int file_deleted_count = clean_userdb_files();
   int total_deleted_count = folder_deleted_count + file_deleted_count;
+  
+  // 清理后同步
+  LOG(INFO) << "Triggering sync after cleaning...";
+  if (!execute_deployer("/sync")) {
+    LOG(ERROR) << "Post-cleaning sync failed";
+  }
   
   LOG(INFO) << "Userdb cleaning completed. Total deleted entries: " << total_deleted_count;
   send_clean_msg(total_deleted_count);
