@@ -17,11 +17,42 @@
 #endif
 
 #include "lib/detached_thread_manager.hpp"
-#include "userdb_sync_delete.hpp"
+#include "userdb_cleaner.hpp"
 
 namespace fs = std::filesystem;
 
 namespace rime {
+
+UserdbCleaner::UserdbCleaner(const Ticket& ticket) : Processor(ticket) {
+  DLOG(INFO) << "UserdbCleaner initialized";
+  InitializeConfig();
+}
+
+UserdbCleaner::~UserdbCleaner() {
+  DLOG(INFO) << "UserdbCleaner destroyed";
+}
+
+void UserdbCleaner::InitializeConfig() {
+  if (!engine_) {
+    LOG(ERROR) << "Engine is null in UserdbCleaner";
+    return;
+  }
+  
+  if (auto schema = engine_->schema()) {
+    if (auto config = schema->config()) {
+      // 读取触发输入配置
+      if (!config->GetString("userdb_cleaner/trigger_input", &trigger_input_)) {
+        LOG(INFO) << "userdb_cleaner/trigger_input not set, using default: " << trigger_input_;
+      } else {
+        LOG(INFO) << "UserdbCleaner trigger_input: " << trigger_input_;
+      }
+    } else {
+      LOG(ERROR) << "Failed to get config in UserdbCleaner";
+    }
+  } else {
+    LOG(ERROR) << "Failed to get schema in UserdbCleaner";
+  }
+}
 
 /**
  * 获取目录下所有的 .userdb 文件夹
@@ -29,12 +60,14 @@ namespace rime {
 std::vector<fs::path> get_userdb_folders(const fs::path& dir) {
   std::vector<fs::path> result;
   if (!fs::exists(dir)) {
-    LOG(INFO) << "Doesn't has .userdb folderes.";
+    LOG(INFO) << "No .userdb folders found in directory: " << dir.string();
     return result;
   }
   if (!fs::is_directory(dir)) {
     return result;
   }
+  
+  int folder_count = 0;
   for (const auto& entry : fs::directory_iterator(dir)) {
     try {
       if (entry.is_directory()) {
@@ -47,32 +80,44 @@ std::vector<fs::path> get_userdb_folders(const fs::path& dir) {
         if (name_len > suffix_len &&
             folder_name.substr(name_len - suffix_len) == suffix) {
           result.push_back(path);
+          folder_count++;
         }
       }
     } catch (const fs::filesystem_error& e) {
-      LOG(ERROR) << "Fail to get .usredb folders. ERROR MESSAGE: " << e.what();
+      LOG(ERROR) << "Failed to get .userdb folders. Error: " << e.what();
     }
   }
+  LOG(INFO) << "Found " << folder_count << " .userdb folders";
   return result;
 }
 
 /**
  * 清理用户目录下的 .userdb 文件夹
  */
-void clean_userdb_folders() {
+int clean_userdb_folders() {
   auto user_data_dir = rime_get_api()->get_user_data_dir();
+  LOG(INFO) << "Cleaning userdb folders in: " << user_data_dir;
+  
   auto folders = get_userdb_folders(user_data_dir);
+  int deleted_files_count = 0;
+  
   if (!folders.empty()) {
     for (const auto& folder : folders) {
+      LOG(INFO) << "Processing folder: " << folder.string();
       for (const auto& entry : fs::directory_iterator(folder)) {
         try {
           fs::remove(entry.path());
+          deleted_files_count++;
+          LOG(INFO) << "Deleted file: " << entry.path().string();
         } catch (const fs::filesystem_error& e) {
-          LOG(ERROR) << "Fail to delete '" << entry.path().string() << "'.";
+          LOG(ERROR) << "Failed to delete '" << entry.path().string() << "'. Error: " << e.what();
         }
       }
     }
   }
+  
+  LOG(INFO) << "Cleaned " << deleted_files_count << " files from userdb folders";
+  return deleted_files_count;
 }
 
 /**
@@ -81,20 +126,38 @@ void clean_userdb_folders() {
 std::vector<fs::path> get_userdb_files() {
   std::vector<fs::path> result;
 
-  // rime_get_api()->get_user_id() 在小狼毫上获取的结果为unknown
-  // std::string installation_id = rime_get_api()->get_user_id()
-  auto dir = path(rime_get_api()->get_user_data_dir());
-  if (!fs::is_directory(dir) || !fs::exists(dir)) return result;
+  auto dir = fs::path(rime_get_api()->get_user_data_dir());
+  if (!fs::is_directory(dir) || !fs::exists(dir)) {
+    LOG(ERROR) << "User data directory does not exist: " << dir.string();
+    return result;
+  }
+  
   auto inst_file = dir / "installation.yaml";
   auto sync_dir = dir / "sync";
   Config config;
   std::string installation_id;
-  config.LoadFromFile(inst_file);
-  config.GetString("installation_id", &installation_id);
+  
+  if (config.LoadFromFile(inst_file)) {
+    config.GetString("installation_id", &installation_id);
+  } else {
+    LOG(ERROR) << "Failed to load installation.yaml";
+    return result;
+  }
 
-  if (installation_id.empty()) return result;
+  if (installation_id.empty()) {
+    LOG(ERROR) << "Installation ID is empty";
+    return result;
+  }
+  
   sync_dir = sync_dir / installation_id;
+  LOG(INFO) << "Scanning for userdb files in: " << sync_dir.string();
 
+  if (!fs::exists(sync_dir) || !fs::is_directory(sync_dir)) {
+    LOG(ERROR) << "Sync directory does not exist: " << sync_dir.string();
+    return result;
+  }
+
+  int file_count = 0;
   for (const auto& entry : fs::directory_iterator(sync_dir)) {
     try {
       if (entry.is_regular_file()) {
@@ -107,13 +170,15 @@ std::vector<fs::path> get_userdb_files() {
         if (name_len > suffix_len &&
             file_name.substr(name_len - suffix_len) == suffix) {
           result.push_back(path);
+          file_count++;
         }
       }
     } catch (const fs::filesystem_error& e) {
-      LOG(ERROR) << "Fail to get .userdb.txt files. ERROR MESSAGE: "
-                 << e.what();
+      LOG(ERROR) << "Failed to get .userdb.txt files. Error: " << e.what();
     }
   }
+  
+  LOG(INFO) << "Found " << file_count << " .userdb.txt files";
   return result;
 }
 
@@ -156,18 +221,24 @@ double parse_c_value(const std::string& line) {
  */
 int clean_userdb_files() {
   auto files = get_userdb_files();
-  auto delete_item_count = 0;
+  int delete_item_count = 0;
+  
   if (!files.empty()) {
     std::string line;
     line.reserve(256);
 
     for (const auto& file : files) {
+      LOG(INFO) << "Processing file: " << file.string();
       if (fs::exists(file) && fs::is_regular_file(file)) {
         std::ifstream in(file, std::ios::binary);
         std::string temp_file = file.string() + ".cache";
         std::ofstream out(temp_file, std::ios::binary);
-        if (!in.is_open() || !out.is_open()) continue;
+        if (!in.is_open() || !out.is_open()) {
+          LOG(ERROR) << "Failed to open file: " << file.string();
+          continue;
+        }
 
+        int file_deleted_count = 0;
         while (std::getline(in, line)) {
           if (line.empty()) continue;
           // 提取并检查 c 值
@@ -177,6 +248,7 @@ int clean_userdb_files() {
             out << line << "\n";
           } else {
             delete_item_count++;
+            file_deleted_count++;
           }
           line.clear();
         }
@@ -188,21 +260,25 @@ int clean_userdb_files() {
         fs::remove(file);
         std::string new_file = file.string();
         fs::rename(temp_file, new_file);
+        
+        LOG(INFO) << "File " << file.filename().string() << ": deleted " << file_deleted_count << " invalid entries";
       }
     }
   }
+  
+  LOG(INFO) << "Total deleted invalid entries from userdb files: " << delete_item_count;
   return delete_item_count;
 }
 
 /**
  * 发送清理结果通知
  */
-void send_clean_msg(const int& deleteItemCount) {
+void send_clean_msg(const int& delete_item_count) {
 #if defined(_WIN32) || defined(_WIN64)
   auto content = L"用户词典共清理  行无效词条";
   std::wstring str = content;
   std::wstringstream wss;
-  wss << deleteItemCount;
+  wss << delete_item_count;
   str.insert(8, wss.str());
   MessageBoxW(NULL, str.c_str(), L"通知", MB_OK);
 #elif __APPLE__
@@ -214,21 +290,34 @@ void send_clean_msg(const int& deleteItemCount) {
  * 执行清理任务
  */
 void process_clean_task() {
-  clean_userdb_folders();
-  auto count = clean_userdb_files();
-  send_clean_msg(count);
+  LOG(INFO) << "Starting userdb cleaning task...";
+  
+  int folder_deleted_count = clean_userdb_folders();
+  int file_deleted_count = clean_userdb_files();
+  int total_deleted_count = folder_deleted_count + file_deleted_count;
+  
+  LOG(INFO) << "Userdb cleaning completed. Total deleted entries: " << total_deleted_count;
+  send_clean_msg(total_deleted_count);
 }
 
-ProcessResult UserdbSyncDelete::ProcessKeyEvent(const KeyEvent& key_event) {
+ProcessResult UserdbCleaner::ProcessKeyEvent(const KeyEvent& key_event) {
 #if defined(_WIN32) || defined(_WIN64)
   auto ctx = engine_->context();
   auto input = ctx->input();
-  if (input == "/del") {
+  
+  DLOG(INFO) << "UserdbCleaner processing input: " << input << ", trigger: " << trigger_input_;
+  
+  if (input == trigger_input_) {
     ctx->Clear();
+    LOG(INFO) << "UserdbCleaner triggered by input: " << trigger_input_;
+    
     // 启动一个线程来执行清理任务, 避免系统等待用户关闭窗口导致系统阻塞
     DetachedThreadManager manager;
     if (manager.try_start(process_clean_task)) {
+      LOG(INFO) << "UserdbCleaner task started successfully";
       return kAccepted;
+    } else {
+      LOG(ERROR) << "Failed to start UserdbCleaner task - already running";
     }
   }
 #endif
