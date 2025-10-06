@@ -65,9 +65,12 @@ void UserdbCleaner::InitializeConfig() {
  */
 bool execute_deployer(const std::string& argument) {
 #if defined(_WIN32) || defined(_WIN64)
-  // 获取共享数据目录（程序安装目录）
-  char shared_data_dir[1024] = {0};
-  rime_get_api()->get_shared_data_dir_s(shared_data_dir, sizeof(shared_data_dir));
+  // 使用 get_shared_data_dir 获取程序安装目录
+  const char* shared_data_dir = rime_get_api()->get_shared_data_dir();
+  if (!shared_data_dir) {
+    LOG(ERROR) << "Failed to get shared data directory";
+    return false;
+  }
   
   // 构建 WeaselDeployer.exe 路径
   fs::path shared_path(shared_data_dir);
@@ -204,9 +207,12 @@ std::vector<fs::path> get_userdb_files() {
   std::vector<fs::path> result;
 
   // 使用 get_sync_dir 获取同步目录
-  char sync_dir_buffer[1024] = {0};
-  rime_get_api()->get_sync_dir(sync_dir_buffer, sizeof(sync_dir_buffer));
-  fs::path sync_dir(sync_dir_buffer);
+  const char* sync_dir_cstr = rime_get_api()->get_sync_dir();
+  if (!sync_dir_cstr) {
+    LOG(ERROR) << "Failed to get sync directory";
+    return result;
+  }
+  fs::path sync_dir(sync_dir_cstr);
 
   LOG(INFO) << "Scanning for userdb files in sync directory: " << sync_dir.string();
 
