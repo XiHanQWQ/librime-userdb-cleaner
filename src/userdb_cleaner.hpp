@@ -17,7 +17,6 @@ class UserdbCleaner : public Processor {
  private:
   void InitializeConfig();
   std::string trigger_input_ = "/del";  // 默认触发输入
-  bool enabled_ = true;                 // 是否启用
 };
 
 }  // namespace rime
