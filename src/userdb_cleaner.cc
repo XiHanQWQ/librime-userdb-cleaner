@@ -363,10 +363,19 @@ int clean_userdb_files() {
 void send_clean_msg(const int& delete_item_count) {
 #if defined(_WIN32) || defined(_WIN64)
   std::wstringstream wss;
-  wss << L"User dictionary cleaning completed.\n";
-  wss << L"Deleted " << delete_item_count << L" invalid entries.";
+  // wss << L"User dictionary cleaning completed.\n";
+  // wss << L"Deleted " << delete_item_count << L" invalid entries.";
   
-  MessageBoxW(NULL, wss.str().c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
+  // MessageBoxW(NULL, wss.str().c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
+  if (delete_item_count > 0) {
+    wss << L"用户词典清理完成。\n";
+    wss << L"成功删除 " << delete_item_count << L" 个无效词条。";
+  } else {
+    wss << L"用户词典清理完成。\n";
+    wss << L"未发现需要清理的无效词条。";
+  }
+  
+  MessageBoxW(NULL, wss.str().c_str(), L"用户词典清理工具", MB_OK | MB_ICONINFORMATION);  
 #elif __APPLE__
   // macOS 通知实现
   LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
