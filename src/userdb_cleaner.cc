@@ -369,7 +369,7 @@ void send_clean_msg(const int& delete_item_count) {
   // MessageBoxW(NULL, wss.str().c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
   
   wss << L"用户词典清理完成。\n";
-  wss << L"共删除 " << delete_item_count << L" 个无效词条。";
+  wss << L"共删除 " << delete_item_count << L" 行无效词条。";
   
   MessageBoxW(NULL, wss.str().c_str(), L"用户词典清理工具", MB_OK | MB_ICONINFORMATION);
 #elif __APPLE__
