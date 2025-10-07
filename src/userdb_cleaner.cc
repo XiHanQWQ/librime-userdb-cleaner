@@ -367,10 +367,11 @@ void send_clean_msg(const int& delete_item_count) {
   // wss << L"Deleted " << delete_item_count << L" invalid entries.";
   
   // MessageBoxW(NULL, wss.str().c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
-  wss << L"用户字典清理完成\n";
-  wss << L"删除 " << delete_item_count << L" 条无效条目";
   
-  MessageBoxW(NULL, wss.str().c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
+  wss << L"用户词典清理完成。\n";
+  wss << L"共删除 " << delete_item_count << L" 个无效词条。";
+  
+  MessageBoxW(NULL, wss.str().c_str(), L"用户词典清理工具", MB_OK | MB_ICONINFORMATION);
 #elif __APPLE__
   // macOS 通知实现
   LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
