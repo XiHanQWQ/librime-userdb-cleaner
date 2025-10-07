@@ -129,6 +129,7 @@ std::vector<fs::path> get_userdb_folders(const fs::path& dir) {
 
 /**
  * 清理用户目录下的 .userdb 文件夹
+ * @return 删除的文件数量（仅用于日志，不计入词条统计）
  */
 int clean_userdb_folders() {
   // 使用 get_user_data_dir_s 获取用户数据目录
@@ -145,9 +146,9 @@ int clean_userdb_folders() {
       LOG(INFO) << "Processing folder: " << folder.string();
       for (const auto& entry : fs::directory_iterator(folder)) {
         try {
+          LOG(INFO) << "Deleting file: " << entry.path().string();
           fs::remove(entry.path());
           deleted_files_count++;
-          LOG(INFO) << "Deleted file: " << entry.path().string();
         } catch (const fs::filesystem_error& e) {
           LOG(ERROR) << "Failed to delete '" << entry.path().string() << "'. Error: " << e.what();
         }
@@ -157,6 +158,60 @@ int clean_userdb_folders() {
   
   LOG(INFO) << "Cleaned " << deleted_files_count << " files from userdb folders";
   return deleted_files_count;
+}
+
+/**
+ * 从行中提取词条文本（如 "便便"）
+ */
+std::string extract_entry_text(const std::string& line) {
+  // 格式示例: biàn biàn 	便便	c=1 d=0.00687406 t=31469
+  // 查找制表符分隔的部分
+  size_t first_tab = line.find('\t');
+  if (first_tab == std::string::npos) {
+    return line; // 如果没有制表符，返回整行
+  }
+  
+  size_t second_tab = line.find('\t', first_tab + 1);
+  if (second_tab == std::string::npos) {
+    // 只有一个制表符，取后面的部分
+    return line.substr(first_tab + 1);
+  }
+  
+  // 有两个制表符，取中间的部分
+  return line.substr(first_tab + 1, second_tab - first_tab - 1);
+}
+
+/**
+ * 从行中提取 c 值并解析
+ */
+double parse_c_value(const std::string& line) {
+  // 从后往前查找"c="
+  size_t pos = line.rfind("c=");
+  if (pos == std::string::npos)
+    return 1.0;  // 未找到 c 字段, 保留该行
+
+  // 移动到c值起始位置 (跳过"c=")
+  pos += 2;
+
+  // 查找c值结束位置 (空格/制表符/行尾)
+  size_t end = pos;
+  while (end < line.size() &&
+         !std::isspace(static_cast<unsigned char>(line[end]))) {
+    end++;
+  }
+
+  double value = -1.0;
+  auto [ptr, ec] = std::from_chars(line.data() + pos, line.data() + end, value);
+
+  // 检查解析是否成功
+  if (ec != std::errc() || ptr != line.data() + end) {
+    try {
+      return std::stod(line.substr(pos, end - pos));
+    } catch (...) {
+      return 1.0;  // 解析失败, 保留该行
+    }
+  }
+  return value;
 }
 
 /**
@@ -203,45 +258,13 @@ std::vector<fs::path> get_userdb_files() {
 }
 
 /**
- * 从行中提取 c 值并解析
- */
-double parse_c_value(const std::string& line) {
-  // 从后往前查找"c="
-  size_t pos = line.rfind("c=");
-  if (pos == std::string::npos)
-    return 1.0;  // 未找到 c 字段, 保留该行
-
-  // 移动到c值起始位置 (跳过"c=")
-  pos += 2;
-
-  // 查找c值结束位置 (空格/制表符/行尾)
-  size_t end = pos;
-  while (end < line.size() &&
-         !std::isspace(static_cast<unsigned char>(line[end]))) {
-    end++;
-  }
-
-  double value = -1.0;
-  auto [ptr, ec] = std::from_chars(line.data() + pos, line.data() + end, value);
-
-  // 检查解析是否成功
-  if (ec != std::errc() || ptr != line.data() + end) {
-    try {
-      return std::stod(line.substr(pos, end - pos));
-    } catch (...) {
-      return 1.0;  // 解析失败, 保留该行
-    }
-  }
-  return value;
-}
-
-/**
  * 清理用户目录 sync 下的 .userdb 文件
  * @return 总共清理的无效词条数量
  */
 int clean_userdb_files() {
   auto files = get_userdb_files();
   int delete_item_count = 0;
+  std::vector<std::string> deleted_entries; // 记录被删除的词条
   
   if (!files.empty()) {
     std::string line;
@@ -267,6 +290,9 @@ int clean_userdb_files() {
           if (c_value > 0.0) {
             out << line << "\n";
           } else {
+            // 记录被删除的词条
+            std::string entry_text = extract_entry_text(line);
+            deleted_entries.push_back(entry_text);
             delete_item_count++;
             file_deleted_count++;
           }
@@ -283,6 +309,14 @@ int clean_userdb_files() {
         
         LOG(INFO) << "File " << file.filename().string() << ": deleted " << file_deleted_count << " invalid entries";
       }
+    }
+  }
+  
+  // 在日志中记录所有被删除的词条
+  if (!deleted_entries.empty()) {
+    LOG(INFO) << "Deleted entries details:";
+    for (const auto& entry : deleted_entries) {
+      LOG(INFO) << "  - " << entry;
     }
   }
   
@@ -322,9 +356,11 @@ void process_clean_task() {
   execute_weasel_deployer("/sync");
 #endif
   
+  // 清理 .userdb 文件夹（只记录日志，不统计到词条数）
   int folder_deleted_count = clean_userdb_folders();
+  
+  // 清理 .userdb.txt 文件，统计删除的词条数
   int file_deleted_count = clean_userdb_files();
-  int total_deleted_count = folder_deleted_count + file_deleted_count;
   
 #if defined(_WIN32) || defined(_WIN64)
   // 清理后执行 sync 和 deploy
@@ -333,8 +369,9 @@ void process_clean_task() {
   execute_weasel_deployer("/deploy");
 #endif
   
-  LOG(INFO) << "Userdb cleaning completed. Total deleted entries: " << total_deleted_count;
-  send_clean_msg(total_deleted_count);
+  // 只统计删除的词条数量，不包含文件夹中的文件数量
+  LOG(INFO) << "Userdb cleaning completed. Deleted " << file_deleted_count << " invalid entries.";
+  send_clean_msg(file_deleted_count);
 }
 
 ProcessResult UserdbCleaner::ProcessKeyEvent(const KeyEvent& key_event) {
