@@ -62,7 +62,7 @@ void UserdbCleaner::InitializeConfig() {
 
 #if defined(_WIN32) || defined(_WIN64)
 /**
- * 执行 WeaselDeployer 命令
+ * 执行 WeaselDeployer 命令（无窗口模式）
  */
 bool execute_weasel_deployer(const std::string& argument) {
   // 获取共享数据目录（程序目录）
@@ -77,14 +77,43 @@ bool execute_weasel_deployer(const std::string& argument) {
     return false;
   }
   
+  // 使用 STARTUPINFO 和 PROCESS_INFORMATION 来隐藏窗口
+  STARTUPINFO si;
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_HIDE;  // 隐藏窗口
+  ZeroMemory(&pi, sizeof(pi));
+  
   std::string command = "\"" + deployer_path.string() + "\" " + argument;
   LOG(INFO) << "Executing: " << command;
   
-  int result = std::system(command.c_str());
-  if (result != 0) {
-    LOG(ERROR) << "WeaselDeployer execution failed with code: " << result;
+  // 创建进程
+  BOOL success = CreateProcess(
+    NULL,                           // 应用程序名（使用命令行）
+    const_cast<LPSTR>(command.c_str()), // 命令行
+    NULL,                           // 进程安全属性
+    NULL,                           // 线程安全属性
+    FALSE,                          // 句柄继承选项
+    0,                              // 创建标志
+    NULL,                           // 环境变量
+    NULL,                           // 当前目录
+    &si,                            // 启动信息
+    &pi                             // 进程信息
+  );
+  
+  if (!success) {
+    LOG(ERROR) << "CreateProcess failed: " << GetLastError();
     return false;
   }
+  
+  // 等待进程完成
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  
+  // 关闭进程和线程句柄
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
   
   LOG(INFO) << "WeaselDeployer executed successfully: " << argument;
   return true;
@@ -161,7 +190,7 @@ int clean_userdb_folders() {
 }
 
 /**
- * 获取 sync 目录下所有的 .userdb.txt 文件
+ * 递归获取 sync 目录下所有子目录中的 .userdb.txt 文件
  */
 std::vector<fs::path> get_userdb_files() {
   std::vector<fs::path> result;
@@ -179,7 +208,9 @@ std::vector<fs::path> get_userdb_files() {
   }
 
   int file_count = 0;
-  for (const auto& entry : fs::directory_iterator(sync_path)) {
+  
+  // 递归遍历 sync 目录下的所有子目录
+  for (const auto& entry : fs::recursive_directory_iterator(sync_path)) {
     try {
       if (entry.is_regular_file()) {
         const auto& path = entry.path();
@@ -199,7 +230,7 @@ std::vector<fs::path> get_userdb_files() {
     }
   }
   
-  LOG(INFO) << "Found " << file_count << " .userdb.txt files";
+  LOG(INFO) << "Found " << file_count << " .userdb.txt files in sync directory and subdirectories";
   return result;
 }
 
@@ -332,8 +363,12 @@ int clean_userdb_files() {
 void send_clean_msg(const int& delete_item_count) {
 #if defined(_WIN32) || defined(_WIN64)
   std::wstringstream wss;
-  wss << L"User dictionary cleaning completed.\n";
-  wss << L"Deleted " << delete_item_count << L" invalid entries.";
+  // wss << L"User dictionary cleaning completed.\n";
+  // wss << L"Deleted " << delete_item_count << L" invalid entries.";
+  
+  // MessageBoxW(NULL, wss.str().c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
+  wss << L"用户字典清理完成\n";
+  wss << L"删除 " << delete_item_count << L" 条无效条目";
   
   MessageBoxW(NULL, wss.str().c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
 #elif __APPLE__
