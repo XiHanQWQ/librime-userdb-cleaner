@@ -362,22 +362,28 @@ int clean_userdb_files() {
  */
 void send_clean_msg(const int& delete_item_count) {
 #if defined(_WIN32) || defined(_WIN64)
-  std::wstringstream wss;
-  if (delete_item_count > 0) {  
-  wss << L"User dictionary cleaning completed.\n";
-  wss << L"Deleted " << delete_item_count << L" invalid entries.";
-  } else {
-    wss << L"User dictionary cleaning completed.\n";
-    wss << L"No invalid entries found to clean up.";
-  }    
+  std::wstring message;
   
-  MessageBoxW(NULL, wss.str().c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
+  if (delete_item_count > 0) {
+    message = L"User dictionary cleaning completed.\nDeleted " + 
+              std::to_wstring(delete_item_count) + L" invalid entries.";
+  } else {
+    message = L"User dictionary cleaning completed.\nNo invalid entries found to clean up.";
+  }
+  
+  MessageBoxW(NULL, message.c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
 #elif __APPLE__
-  // macOS 通知实现
-  LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+  if (delete_item_count > 0) {
+    LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+  } else {
+    LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
+  }
 #elif __linux__
-  // Linux 通知实现
-  LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+  if (delete_item_count > 0) {
+    LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+  } else {
+    LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
+  }
 #endif
 }
 
