@@ -360,29 +360,59 @@ int clean_userdb_files() {
 /**
  * 发送清理结果通知
  */
+// void send_clean_msg(const int& delete_item_count) {
+// #if defined(_WIN32) || defined(_WIN64)
+//   std::wstring message;
+  
+//   if (delete_item_count > 0) {
+//     message = L"User dictionary cleaning completed.\nDeleted " + 
+//               std::to_wstring(delete_item_count) + L" invalid entries.";
+//   } else {
+//     message = L"User dictionary cleaning completed.\nNo invalid entries found to clean up.";
+//   }
+  
+//   MessageBoxW(NULL, message.c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
+// #elif __APPLE__
+//   if (delete_item_count > 0) {
+//     LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+//   } else {
+//     LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
+//   }
+// #elif __linux__
+//   if (delete_item_count > 0) {
+//     LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+//   } else {
+//     LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
+//   }
+// #endif
+// }
+
+/**
+ * 发送清理结果通知
+ */
 void send_clean_msg(const int& delete_item_count) {
 #if defined(_WIN32) || defined(_WIN64)
   std::wstring message;
   
   if (delete_item_count > 0) {
-    message = L"User dictionary cleaning completed.\nDeleted " + 
-              std::to_wstring(delete_item_count) + L" invalid entries.";
+    message = L"用户词典清理完成。\n删除了 " + 
+              std::to_wstring(delete_item_count) + L" 个无效词条。";
   } else {
-    message = L"User dictionary cleaning completed.\nNo invalid entries found to clean up.";
+    message = L"用户词典清理完成。\n未找到需要清理的无效词条。";
   }
   
-  MessageBoxW(NULL, message.c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
+  MessageBoxW(NULL, message.c_str(), L"用户词典清理工具", MB_OK | MB_ICONINFORMATION);
 #elif __APPLE__
   if (delete_item_count > 0) {
-    LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+    LOG(INFO) << "用户词典清理完成。删除了 " << delete_item_count << " 个无效词条。";
   } else {
-    LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
+    LOG(INFO) << "用户词典清理完成。未找到需要清理的无效词条。";
   }
 #elif __linux__
   if (delete_item_count > 0) {
-    LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+    LOG(INFO) << "用户词典清理完成。删除了 " << delete_item_count << " 个无效词条。";
   } else {
-    LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
+    LOG(INFO) << "用户词典清理完成。未找到需要清理的无效词条。";
   }
 #endif
 }
