@@ -6,13 +6,13 @@
 
 namespace rime {
 
-static void rime_custom_initialize() {
+static void rime_userdbcleaner_initialize() {
   Registry& r = Registry::instance();
   r.Register("userdb_cleaner", new Component<UserdbCleaner>);
 }
 
-static void rime_custom_finalize() {}
+static void rime_userdbcleaner_finalize() {}
 
-RIME_REGISTER_MODULE(custom)
+RIME_REGISTER_MODULE(userdbcleaner)
 
 }  // namespace rime

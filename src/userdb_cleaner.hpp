@@ -4,6 +4,8 @@
 #include <rime/common.h>
 #include <rime/processor.h>
 #include <rime/config.h>
+#include <vector>
+#include <string>
 
 namespace rime {
 
@@ -17,6 +19,7 @@ class UserdbCleaner : public Processor {
  private:
   void InitializeConfig();
   std::string trigger_input_ = "/del";  // 默认触发输入
+  std::vector<std::string> cleanup_userdb_list_;  // 需要清理的userdb列表
 };
 
 }  // namespace rime

@@ -58,6 +58,23 @@ void UserdbCleaner::InitializeConfig() {
   } else {
     LOG(INFO) << "UserdbCleaner trigger_input: " << trigger_input_;
   }
+
+  // 读取需要清理的userdb列表
+  if (auto list = config->GetList("userdb_cleaner/cleanup_userdb_list")) {
+    cleanup_userdb_list_.clear();
+    for (size_t i = 0; i < list->size(); ++i) {
+      if (auto item = list->GetValueAt(i)) {
+        std::string db_name;
+        if (item->GetString(&db_name)) {
+          cleanup_userdb_list_.push_back(db_name);
+          LOG(INFO) << "Added to cleanup list: " << db_name;
+        }
+      }
+    }
+    LOG(INFO) << "Cleanup userdb list has " << cleanup_userdb_list_.size() << " items";
+  } else {
+    LOG(INFO) << "No cleanup_userdb_list specified, will clean all userdb files";
+  }
 }
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -192,9 +209,53 @@ fs::path get_sync_directory() {
 }
 
 /**
- * 获取目录下所有的 .userdb 文件夹
+ * 检查是否需要清理指定的userdb
  */
-std::vector<fs::path> get_userdb_folders(const fs::path& dir) {
+bool should_clean_userdb(const std::string& db_name, const std::vector<std::string>& cleanup_list) {
+  // 如果清理列表为空，则清理所有
+  if (cleanup_list.empty()) {
+    return true;
+  }
+  
+  // 检查是否在清理列表中
+  for (const auto& allowed_db : cleanup_list) {
+    if (db_name == allowed_db) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+/**
+ * 从路径中提取userdb名称
+ */
+std::string extract_userdb_name(const fs::path& path) {
+  std::string filename = path.filename().string();
+  
+  // 处理 .userdb 文件夹
+  if (fs::is_directory(path)) {
+    const std::string suffix = ".userdb";
+    if (filename.length() > suffix.length() && 
+        filename.substr(filename.length() - suffix.length()) == suffix) {
+      return filename.substr(0, filename.length() - suffix.length());
+    }
+  }
+  
+  // 处理 .userdb.txt 文件
+  const std::string suffix = ".userdb.txt";
+  if (filename.length() > suffix.length() && 
+      filename.substr(filename.length() - suffix.length()) == suffix) {
+    return filename.substr(0, filename.length() - suffix.length());
+  }
+  
+  return "";
+}
+
+/**
+ * 获取目录下所有的 .userdb 文件夹（根据清理列表过滤）
+ */
+std::vector<fs::path> get_userdb_folders(const fs::path& dir, const std::vector<std::string>& cleanup_list) {
   std::vector<fs::path> result;
   if (!fs::exists(dir)) {
     LOG(INFO) << "No .userdb folders found in directory: " << dir.string();
@@ -205,6 +266,7 @@ std::vector<fs::path> get_userdb_folders(const fs::path& dir) {
   }
   
   int folder_count = 0;
+  int filtered_count = 0;
   for (const auto& entry : fs::directory_iterator(dir)) {
     try {
       if (entry.is_directory()) {
@@ -216,29 +278,35 @@ std::vector<fs::path> get_userdb_folders(const fs::path& dir) {
         const size_t name_len = folder_name.length();
         if (name_len > suffix_len &&
             folder_name.substr(name_len - suffix_len) == suffix) {
-          result.push_back(path);
-          folder_count++;
+          std::string db_name = extract_userdb_name(path);
+          if (should_clean_userdb(db_name, cleanup_list)) {
+            result.push_back(path);
+            folder_count++;
+          } else {
+            filtered_count++;
+            LOG(INFO) << "Skipping folder (not in cleanup list): " << folder_name;
+          }
         }
       }
     } catch (const fs::filesystem_error& e) {
       LOG(ERROR) << "Failed to get .userdb folders. Error: " << e.what();
     }
   }
-  LOG(INFO) << "Found " << folder_count << " .userdb folders";
+  LOG(INFO) << "Found " << folder_count << " .userdb folders (" << filtered_count << " filtered out)";
   return result;
 }
 
 /**
  * 清理用户目录下的 .userdb 文件夹
  */
-int clean_userdb_folders() {
+int clean_userdb_folders(const std::vector<std::string>& cleanup_list) {
   // 使用 get_user_data_dir_s 获取用户数据目录
   char user_data_dir[1024] = {0};
   rime_get_api()->get_user_data_dir_s(user_data_dir, sizeof(user_data_dir));
   
   LOG(INFO) << "Cleaning userdb folders in: " << user_data_dir;
   
-  auto folders = get_userdb_folders(user_data_dir);
+  auto folders = get_userdb_folders(user_data_dir, cleanup_list);
   int deleted_files_count = 0;
   
   if (!folders.empty()) {
@@ -261,9 +329,9 @@ int clean_userdb_folders() {
 }
 
 /**
- * 递归获取 sync 目录下所有子目录中的 .userdb.txt 文件
+ * 递归获取 sync 目录下所有子目录中的 .userdb.txt 文件（根据清理列表过滤）
  */
-std::vector<fs::path> get_userdb_files() {
+std::vector<fs::path> get_userdb_files(const std::vector<std::string>& cleanup_list) {
   std::vector<fs::path> result;
 
   // 使用新的同步目录获取方法
@@ -277,6 +345,7 @@ std::vector<fs::path> get_userdb_files() {
   }
 
   int file_count = 0;
+  int filtered_count = 0;
   
   // 递归遍历 sync 目录下的所有子目录
   for (const auto& entry : fs::recursive_directory_iterator(sync_path)) {
@@ -290,8 +359,14 @@ std::vector<fs::path> get_userdb_files() {
         const size_t name_len = file_name.length();
         if (name_len > suffix_len &&
             file_name.substr(name_len - suffix_len) == suffix) {
-          result.push_back(path);
-          file_count++;
+          std::string db_name = extract_userdb_name(path);
+          if (should_clean_userdb(db_name, cleanup_list)) {
+            result.push_back(path);
+            file_count++;
+          } else {
+            filtered_count++;
+            LOG(INFO) << "Skipping file (not in cleanup list): " << file_name;
+          }
         }
       }
     } catch (const fs::filesystem_error& e) {
@@ -299,7 +374,7 @@ std::vector<fs::path> get_userdb_files() {
     }
   }
   
-  LOG(INFO) << "Found " << file_count << " .userdb.txt files in sync directory and subdirectories";
+  LOG(INFO) << "Found " << file_count << " .userdb.txt files in sync directory and subdirectories (" << filtered_count << " filtered out)";
   return result;
 }
 
@@ -363,8 +438,8 @@ std::string extract_word_text(const std::string& line) {
  * 清理用户目录 sync 下的 .userdb 文件
  * @return 总共清理的无效词条数量
  */
-int clean_userdb_files() {
-  auto files = get_userdb_files();
+int clean_userdb_files(const std::vector<std::string>& cleanup_list) {
+  auto files = get_userdb_files(cleanup_list);
   int delete_item_count = 0;
   std::vector<std::string> deleted_words;  // 记录删除的词条
   
@@ -426,33 +501,6 @@ int clean_userdb_files() {
   return delete_item_count;
 }
 
-// void send_clean_msg(const int& delete_item_count) {
-// #if defined(_WIN32) || defined(_WIN64)
-//   std::wstring message;
-  
-//   if (delete_item_count > 0) {
-//     message = L"User dictionary cleaning completed.\nDeleted " + 
-//               std::to_wstring(delete_item_count) + L" invalid entries.";
-//   } else {
-//     message = L"User dictionary cleaning completed.\nNo invalid entries found to clean up.";
-//   }
-  
-//   MessageBoxW(NULL, message.c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
-// #elif __APPLE__
-//   if (delete_item_count > 0) {
-//     LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
-//   } else {
-//     LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
-//   }
-// #elif __linux__
-//   if (delete_item_count > 0) {
-//     LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
-//   } else {
-//     LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
-//   }
-// #endif
-// }
-
 /**
  * 发送清理结果通知
  */
@@ -471,14 +519,24 @@ void send_clean_msg(const int& delete_item_count) {
   
   MessageBoxW(NULL, message.c_str(), title.c_str(), MB_OK | MB_ICONINFORMATION);
 #elif __APPLE__
+  if (delete_item_count > 0) {
+    LOG(INFO) << "用户词典清理完成。删除了 " << delete_item_count << " 个无效词条。";
+  } else {
+    LOG(INFO) << "用户词典清理完成。未找到需要清理的无效词条。";
+  }
 #elif __linux__
+  if (delete_item_count > 0) {
+    LOG(INFO) << "用户词典清理完成。删除了 " << delete_item_count << " 个无效词条。";
+  } else {
+    LOG(INFO) << "用户词典清理完成。未找到需要清理的无效词条。";
+  }
 #endif
 }
 
 /**
  * 执行清理任务
  */
-void process_clean_task() {
+void process_clean_task(const std::vector<std::string>& cleanup_list) {
   LOG(INFO) << "Starting userdb cleaning task...";
   
 #if defined(_WIN32) || defined(_WIN64)
@@ -487,8 +545,8 @@ void process_clean_task() {
   execute_weasel_deployer("/sync");
 #endif
   
-  int folder_deleted_count = clean_userdb_folders();
-  int file_deleted_count = clean_userdb_files();  // 这个只统计 userdb.txt 中的无效词条数
+  int folder_deleted_count = clean_userdb_folders(cleanup_list);
+  int file_deleted_count = clean_userdb_files(cleanup_list);  // 这个只统计 userdb.txt 中的无效词条数
   
   // 通知中只显示删除的词条总数（file_deleted_count）
   int total_notification_count = file_deleted_count;
@@ -514,9 +572,9 @@ ProcessResult UserdbCleaner::ProcessKeyEvent(const KeyEvent& key_event) {
     ctx->Clear();
     LOG(INFO) << "UserdbCleaner triggered by input: " << trigger_input_;
     
-    // 启动一个线程来执行清理任务
+    // 启动一个线程来执行清理任务，传递清理列表
     DetachedThreadManager manager;
-    if (manager.try_start(process_clean_task)) {
+    if (manager.try_start([this]() { process_clean_task(cleanup_userdb_list_); })) {
       LOG(INFO) << "UserdbCleaner task started successfully";
       return kAccepted;
     } else {
