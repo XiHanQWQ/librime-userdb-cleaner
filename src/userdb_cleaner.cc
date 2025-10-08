@@ -458,7 +458,7 @@ int clean_userdb_files() {
  */
 void send_clean_msg(const int& delete_item_count) {
 #if defined(_WIN32) || defined(_WIN64)
-  // 方法1: 直接使用宽字符串字面量（避免编码转换问题）
+  // 直接使用宽字符串字面量，避免编码转换问题
   std::wstring message;
   std::wstring title = L"用户词典清理工具";
   
