@@ -360,29 +360,71 @@ int clean_userdb_files() {
 /**
  * 发送清理结果通知
  */
+// void send_clean_msg(const int& delete_item_count) {
+// #if defined(_WIN32) || defined(_WIN64)
+//   std::wstring message;
+  
+//   if (delete_item_count > 0) {
+//     message = L"User dictionary cleaning completed.\nDeleted " + 
+//               std::to_wstring(delete_item_count) + L" invalid entries.";
+//   } else {
+//     message = L"User dictionary cleaning completed.\nNo invalid entries found to clean up.";
+//   }
+  
+//   MessageBoxW(NULL, message.c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
+// #elif __APPLE__
+//   if (delete_item_count > 0) {
+//     LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+//   } else {
+//     LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
+//   }
+// #elif __linux__
+//   if (delete_item_count > 0) {
+//     LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+//   } else {
+//     LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
+//   }
+// #endif
+// }
+
+/**
+ * 发送清理结果通知
+ */
 void send_clean_msg(const int& delete_item_count) {
 #if defined(_WIN32) || defined(_WIN64)
-  std::wstring message;
+  // 使用 UTF-8 编码的字符串，然后转换为宽字符串
+  std::string utf8_message;
   
   if (delete_item_count > 0) {
-    message = L"User dictionary cleaning completed.\nDeleted " + 
-              std::to_wstring(delete_item_count) + L" invalid entries.";
+    utf8_message = "用户词典清理完成。\n删除了 " + 
+                   std::to_string(delete_item_count) + " 个无效词条。";
   } else {
-    message = L"User dictionary cleaning completed.\nNo invalid entries found to clean up.";
+    utf8_message = "用户词典清理完成。\n未找到需要清理的无效词条。";
   }
   
-  MessageBoxW(NULL, message.c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
+  // 将 UTF-8 字符串转换为宽字符串
+  int wide_length = MultiByteToWideChar(CP_UTF8, 0, utf8_message.c_str(), -1, nullptr, 0);
+  std::wstring wide_message(wide_length, 0);
+  MultiByteToWideChar(CP_UTF8, 0, utf8_message.c_str(), -1, &wide_message[0], wide_length);
+  
+  // 标题也使用 UTF-8 转换
+  std::string utf8_title = "用户词典清理工具";
+  int title_length = MultiByteToWideChar(CP_UTF8, 0, utf8_title.c_str(), -1, nullptr, 0);
+  std::wstring wide_title(title_length, 0);
+  MultiByteToWideChar(CP_UTF8, 0, utf8_title.c_str(), -1, &wide_title[0], title_length);
+  
+  MessageBoxW(NULL, wide_message.c_str(), wide_title.c_str(), MB_OK | MB_ICONINFORMATION);
 #elif __APPLE__
   if (delete_item_count > 0) {
-    LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+    LOG(INFO) << "用户词典清理完成。删除了 " << delete_item_count << " 个无效词条。";
   } else {
-    LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
+    LOG(INFO) << "用户词典清理完成。未找到需要清理的无效词条。";
   }
 #elif __linux__
   if (delete_item_count > 0) {
-    LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+    LOG(INFO) << "用户词典清理完成。删除了 " << delete_item_count << " 个无效词条。";
   } else {
-    LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
+    LOG(INFO) << "用户词典清理完成。未找到需要清理的无效词条。";
   }
 #endif
 }
