@@ -458,21 +458,20 @@ int clean_userdb_files() {
  */
 void send_clean_msg(const int& delete_item_count) {
 #if defined(_WIN32) || defined(_WIN64)
-  // 使用 Unicode 转义序列
+  // 方法1: 直接使用宽字符串字面量（避免编码转换问题）
   std::wstring message;
+  std::wstring title = L"用户词典清理工具";
   
   if (delete_item_count > 0) {
-    message = L"\u7528\u6237\u8bcd\u5178\u6e05\u7406\u5b8c\u6210\u3002\n\u5220\u9664\u4e86 " + 
-              std::to_wstring(delete_item_count) + L" \u4e2a\u65e0\u6548\u8bcd\u6761\u3002";
+    message = L"用户词典清理完成。\n删除了 " + 
+              std::to_wstring(delete_item_count) + L" 个无效词条。";
   } else {
-    message = L"\u7528\u6237\u8bcd\u5178\u6e05\u7406\u5b8c\u6210\u3002\n\u672a\u627e\u5230\u9700\u8981\u6e05\u7406\u7684\u65e0\u6548\u8bcd\u6761\u3002";
+    message = L"用户词典清理完成。\n未找到需要清理的无效词条。";
   }
   
-  MessageBoxW(NULL, message.c_str(), L"\u7528\u6237\u8bcd\u5178\u6e05\u7406\u5de5\u5177", MB_OK | MB_ICONINFORMATION);
+  MessageBoxW(NULL, message.c_str(), title.c_str(), MB_OK | MB_ICONINFORMATION);
 #elif __APPLE__
-  
 #elif __linux__
-  
 #endif
 }
 
