@@ -1,4 +1,4 @@
-﻿#include <rime/common.h>
+#include <rime/common.h>
 #include <rime/config.h>
 #include <rime/context.h>
 #include <rime/engine.h>
@@ -65,8 +65,9 @@ void UserdbCleaner::InitializeConfig() {
  * 执行 WeaselDeployer 命令（无窗口模式）
  */
 bool execute_weasel_deployer(const std::string& argument) {
-  // 获取共享数据目录（程序目录）- 使用非安全版本
-  const char* shared_data_dir = rime_get_api()->get_shared_data_dir();
+  // 获取共享数据目录（程序目录）
+  char shared_data_dir[1024] = {0};
+  rime_get_api()->get_shared_data_dir_s(shared_data_dir, sizeof(shared_data_dir));
   
   // WeaselDeployer.exe 在共享数据目录的父目录中
   fs::path deployer_path = fs::path(shared_data_dir).parent_path() / "WeaselDeployer.exe";
@@ -125,71 +126,65 @@ bool execute_weasel_deployer(const std::string& argument) {
 fs::path get_sync_directory() {
   fs::path sync_path;
   
-  // 方法1: 使用 get_sync_dir API 函数（非安全版本）
-  const char* sync_dir = rime_get_api()->get_sync_dir();
-  if (sync_dir) {
-    sync_path = fs::path(sync_dir);
-    
-    if (fs::exists(sync_path) && fs::is_directory(sync_path)) {
-      LOG(INFO) << "Using sync directory from API: " << sync_path.string();
-      return sync_path;
-    }
-    
-    LOG(WARNING) << "Sync directory from API does not exist: " << sync_path.string();
-  } else {
-    LOG(WARNING) << "Failed to get sync directory from API";
+  // 方法1: 使用 get_sync_dir_s API 函数
+  char sync_dir[1024] = {0};
+  rime_get_api()->get_sync_dir_s(sync_dir, sizeof(sync_dir));
+  sync_path = fs::path(sync_dir);
+  
+  if (fs::exists(sync_path) && fs::is_directory(sync_path)) {
+    LOG(INFO) << "Using sync directory from API: " << sync_path.string();
+    return sync_path;
   }
   
+  LOG(WARNING) << "Sync directory from API does not exist: " << sync_path.string();
+  
   // 方法2: 解析 installation.yaml 中的 sync_dir 配置
-  const char* user_data_dir = rime_get_api()->get_user_data_dir();
-  if (user_data_dir) {
-    fs::path user_path(user_data_dir);
-    fs::path inst_file = user_path / "installation.yaml";
-    
-    if (fs::exists(inst_file)) {
-      Config config;
-      if (config.LoadFromFile(inst_file)) {
-        std::string custom_sync_dir;
-        if (config.GetString("sync_dir", &custom_sync_dir)) {
-          sync_path = fs::path(custom_sync_dir);
-          
-          // 处理 Windows 路径转义问题
-          #if defined(_WIN32) || defined(_WIN64)
-          // 如果路径包含转义字符，需要处理
-          std::string processed_path = custom_sync_dir;
-          // 替换双反斜杠为单反斜杠（处理转义情况）
-          size_t pos = 0;
-          while ((pos = processed_path.find("\\\\", pos)) != std::string::npos) {
-            processed_path.replace(pos, 2, "\\");
-            pos += 1;
-          }
-          sync_path = fs::path(processed_path);
-          #endif
-          
-          if (fs::exists(sync_path) && fs::is_directory(sync_path)) {
-            LOG(INFO) << "Using sync directory from installation.yaml: " << sync_path.string();
-            return sync_path;
-          } else {
-            LOG(WARNING) << "Sync directory from installation.yaml does not exist: " << sync_path.string();
-          }
+  char user_data_dir[1024] = {0};
+  rime_get_api()->get_user_data_dir_s(user_data_dir, sizeof(user_data_dir));
+  fs::path user_path(user_data_dir);
+  fs::path inst_file = user_path / "installation.yaml";
+  
+  if (fs::exists(inst_file)) {
+    Config config;
+    if (config.LoadFromFile(inst_file)) {
+      std::string custom_sync_dir;
+      if (config.GetString("sync_dir", &custom_sync_dir)) {
+        sync_path = fs::path(custom_sync_dir);
+        
+        // 处理 Windows 路径转义问题
+        #if defined(_WIN32) || defined(_WIN64)
+        // 如果路径包含转义字符，需要处理
+        std::string processed_path = custom_sync_dir;
+        // 替换双反斜杠为单反斜杠（处理转义情况）
+        size_t pos = 0;
+        while ((pos = processed_path.find("\\\\", pos)) != std::string::npos) {
+          processed_path.replace(pos, 2, "\\");
+          pos += 1;
+        }
+        sync_path = fs::path(processed_path);
+        #endif
+        
+        if (fs::exists(sync_path) && fs::is_directory(sync_path)) {
+          LOG(INFO) << "Using sync directory from installation.yaml: " << sync_path.string();
+          return sync_path;
         } else {
-          LOG(INFO) << "No sync_dir configuration found in installation.yaml";
+          LOG(WARNING) << "Sync directory from installation.yaml does not exist: " << sync_path.string();
         }
       } else {
-        LOG(ERROR) << "Failed to load installation.yaml";
+        LOG(INFO) << "No sync_dir configuration found in installation.yaml";
       }
     } else {
-      LOG(WARNING) << "installation.yaml does not exist: " << inst_file.string();
-    }
-    
-    // 方法3: 使用用户目录下的 sync 目录作为默认值
-    sync_path = user_path / "sync";
-    if (fs::exists(sync_path) && fs::is_directory(sync_path)) {
-      LOG(INFO) << "Using default sync directory: " << sync_path.string();
-      return sync_path;
+      LOG(ERROR) << "Failed to load installation.yaml";
     }
   } else {
-    LOG(ERROR) << "Failed to get user data directory";
+    LOG(WARNING) << "installation.yaml does not exist: " << inst_file.string();
+  }
+  
+  // 方法3: 使用用户目录下的 sync 目录作为默认值
+  sync_path = user_path / "sync";
+  if (fs::exists(sync_path) && fs::is_directory(sync_path)) {
+    LOG(INFO) << "Using default sync directory: " << sync_path.string();
+    return sync_path;
   }
   
   LOG(ERROR) << "No valid sync directory found";
@@ -237,13 +232,9 @@ std::vector<fs::path> get_userdb_folders(const fs::path& dir) {
  * 清理用户目录下的 .userdb 文件夹
  */
 int clean_userdb_folders() {
-  // 使用 get_user_data_dir 获取用户数据目录（非安全版本）
-  const char* user_data_dir = rime_get_api()->get_user_data_dir();
-  
-  if (!user_data_dir) {
-    LOG(ERROR) << "Failed to get user data directory";
-    return 0;
-  }
+  // 使用 get_user_data_dir_s 获取用户数据目录
+  char user_data_dir[1024] = {0};
+  rime_get_api()->get_user_data_dir_s(user_data_dir, sizeof(user_data_dir));
   
   LOG(INFO) << "Cleaning userdb folders in: " << user_data_dir;
   
@@ -434,6 +425,33 @@ int clean_userdb_files() {
   LOG(INFO) << "Total deleted invalid entries from userdb files: " << delete_item_count;
   return delete_item_count;
 }
+
+// void send_clean_msg(const int& delete_item_count) {
+// #if defined(_WIN32) || defined(_WIN64)
+//   std::wstring message;
+  
+//   if (delete_item_count > 0) {
+//     message = L"User dictionary cleaning completed.\nDeleted " + 
+//               std::to_wstring(delete_item_count) + L" invalid entries.";
+//   } else {
+//     message = L"User dictionary cleaning completed.\nNo invalid entries found to clean up.";
+//   }
+  
+//   MessageBoxW(NULL, message.c_str(), L"UserDB Cleaner", MB_OK | MB_ICONINFORMATION);
+// #elif __APPLE__
+//   if (delete_item_count > 0) {
+//     LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+//   } else {
+//     LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
+//   }
+// #elif __linux__
+//   if (delete_item_count > 0) {
+//     LOG(INFO) << "User dictionary cleaning completed. Deleted " << delete_item_count << " invalid entries.";
+//   } else {
+//     LOG(INFO) << "User dictionary cleaning completed. No invalid entries found to clean up.";
+//   }
+// #endif
+// }
 
 /**
  * 发送清理结果通知
