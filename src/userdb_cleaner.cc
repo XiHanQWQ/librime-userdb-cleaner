@@ -1,4 +1,4 @@
-#include <rime/common.h>
+﻿#include <rime/common.h>
 #include <rime/config.h>
 #include <rime/context.h>
 #include <rime/engine.h>
@@ -502,9 +502,8 @@ void process_clean_task() {
   LOG(INFO) << "Starting userdb cleaning task...";
   
 #if defined(_WIN32) || defined(_WIN64)
-  // 清理前先执行 deploy 和 sync
+  // 清理前先执行 sync
   LOG(INFO) << "Executing pre-clean deployment...";
-  execute_weasel_deployer("/deploy");
   execute_weasel_deployer("/sync");
 #endif
   
@@ -515,10 +514,9 @@ void process_clean_task() {
   int total_notification_count = file_deleted_count;
   
 #if defined(_WIN32) || defined(_WIN64)
-  // 清理后执行 sync 和 deploy
+  // 清理后执行 sync
   LOG(INFO) << "Executing post-clean deployment...";
   execute_weasel_deployer("/sync");
-  execute_weasel_deployer("/deploy");
 #endif
   
   LOG(INFO) << "Userdb cleaning completed. Total deleted entries: " << file_deleted_count;
