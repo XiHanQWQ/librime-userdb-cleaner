@@ -1,33 +1,41 @@
-解决一些插件在 `Windows`下的性能问题。
+```markdown
+# Rime UserDB Cleaner 插件
 
-**只支持 Windows ！**
+这是一个 Rime 输入法的自定义插件，用于清理用户词典中的无效词条。
 
-- 已实现的插件
+## 功能特性
 
-- [X] userdb_sync_delete: 灵感来自[rime_wanxiang: userdb_sync_delete](https://github.com/amzxyz/rime_wanxiang/blob/main/lua/userdb_sync_delete.lua)
+- 清理用户目录下的 `.userdb` 文件夹内容
+- 清理同步目录下的 `.userdb.txt` 文件中的无效词条（c ≤ 0 的词条）
+- 支持配置需要清理的特定 userdb
+- 支持简略和详细两种信息显示模式
+- Windows 平台支持自动调用 WeaselDeployer 进行同步
 
-### 使用方法
+## 安装配置
 
-1. 克隆项目到 librime 插件目录：
+### 1. 编译插件
+
+将插件源代码编译为 Rime 插件模块。
+
+### 2. 配置说明
+
+在 Rime 配置文件中添加以下配置：
+
+```yaml
+userdb_cleaner:
+  trigger_input: "/clean"  # 触发清理的输入字符串，默认为 "/del"
+  full_information_display: true  # 是否显示完整清理信息，默认为 false
+  cleanup_userdb_list:  # 需要清理的 userdb 列表，不设置或为空则清理所有
+    - rime_sheep_max_zc
+    - rime_sheep
 ```
-cd librime/plugins
 
-git clone https://github.com/sheldonleung/rime-custom-plugins.git
+3. 配置项说明
 
-重命名 rime-custom-plugins 为 custom
-```
-
-2. 编译：
-```
-build.bat
-```
-
-3. 配置:
-
-在xxx.custom.yaml中添加配置以确保插件能够被 rime 加载，如：
-
-```
-engine/processors/@before 1: userdb_sync_delete
-```
-
-> 只面向有动手能力的小伙伴，librime 的具体编译过程请阅读 [librime](https://github.com/rime/librime/blob/master/README-windows.md) 官方教程，或结合官方 [CI](https://github.com/rime/librime/actions) 自行编译。
+· trigger_input: 触发清理操作的输入字符串，当输入该字符串时会启动清理任务
+· full_information_display:
+  · false (默认): 显示简略信息，只显示清理完成和删除的词条数量
+  · true: 显示完整信息，包括清理的文件、文件夹和具体删除的词条
+· cleanup_userdb_list:
+  · 不设置或为空数组: 清理所有 userdb
+  · 设置特定数组: 只清理列表中指定的 userdb
