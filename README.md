@@ -25,8 +25,10 @@ userdb_cleaner:
   trigger_input: "/clean"  # 触发清理的输入字符串，默认为 "/del"
   full_information_display: true  # 是否显示完整清理信息，默认为 false
   cleanup_userdb_list:  # 需要清理的 userdb 列表，不设置或为空则清理所有
-    - rime_sheep_max_zc
-    - rime_sheep
+    - 词库名称1
+    - 词库名称2
+或者
+  cleanup_userdb_list: ["词库名称1", "词库名称2"]
 ```
 
 3. 配置项说明
