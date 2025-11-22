@@ -86,6 +86,13 @@ void UserdbCleaner::InitializeConfig() {
   } else {
     LOG(INFO) << "UserdbCleaner full_information_display: " << full_information_display_;
   }
+
+  // 读取清理阈值配置
+  if (!config->GetInt("userdb_cleaner/clean_threshold", &clean_threshold_)) {
+    LOG(INFO) << "userdb_cleaner/clean_threshold not set, using default: " << clean_threshold_;
+  } else {
+    LOG(INFO) << "UserdbCleaner clean_threshold: " << clean_threshold_;
+  }  
 }
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -494,13 +501,13 @@ std::vector<fs::path> get_userdb_files(const std::vector<std::string>& cleanup_l
 }
 
 /**
- * 从行中提取 c 值并解析
+ * 从行中提取 c 值并解析为整数
  */
-double parse_c_value(const std::string& line) {
+int parse_c_value(const std::string& line) {
   // 从后往前查找"c="
   size_t pos = line.rfind("c=");
   if (pos == std::string::npos)
-    return 1.0;  // 未找到 c 字段, 保留该行
+    return 1;  // 未找到 c 字段, 保留该行
 
   // 移动到c值起始位置 (跳过"c=")
   pos += 2;
@@ -512,15 +519,15 @@ double parse_c_value(const std::string& line) {
     end++;
   }
 
-  double value = -1.0;
+  int value = -1;
   auto [ptr, ec] = std::from_chars(line.data() + pos, line.data() + end, value);
 
   // 检查解析是否成功
   if (ec != std::errc() || ptr != line.data() + end) {
     try {
-      return std::stod(line.substr(pos, end - pos));
+      return std::stoi(line.substr(pos, end - pos));
     } catch (...) {
-      return 1.0;  // 解析失败, 保留该行
+      return 1;  // 解析失败, 保留该行
     }
   }
   return value;
@@ -553,7 +560,10 @@ std::string extract_word_text(const std::string& line) {
  * 清理用户目录 sync 下的 .userdb 文件
  * @return 总共清理的无效词条数量
  */
-int clean_userdb_files(const std::vector<std::string>& cleanup_list, std::vector<std::string>& cleaned_files, std::vector<std::string>& deleted_words) {
+int clean_userdb_files(const std::vector<std::string>& cleanup_list, 
+                      int clean_threshold,
+                      std::vector<std::string>& cleaned_files, 
+                      std::vector<std::string>& deleted_words) {
   auto files = get_userdb_files(cleanup_list, cleaned_files);
   int delete_item_count = 0;
   
@@ -584,9 +594,9 @@ int clean_userdb_files(const std::vector<std::string>& cleanup_list, std::vector
         while (std::getline(in, line)) {
           if (line.empty()) continue;
           // 提取并检查 c 值
-          double c_value = parse_c_value(line);
-          // 把 c > 0 的行写入新文件
-          if (c_value > 0.0) {
+          int c_value = parse_c_value(line);
+          // 把 c >= clean_threshold 的行写入新文件
+          if (c_value >= clean_threshold) {
             out << line << "\n";
           } else {
             // 记录删除的词条
@@ -606,20 +616,20 @@ int clean_userdb_files(const std::vector<std::string>& cleanup_list, std::vector
         std::string new_file = file.string();
         fs::rename(temp_file, new_file);
         
-        LOG(INFO) << "File " << file.filename().string() << ": deleted " << file_deleted_count << " invalid entries";
+        LOG(INFO) << "File " << file.filename().string() << ": deleted " << file_deleted_count << " invalid entries (threshold: " << clean_threshold << ")";
       }
     }
   }
   
   // 在日志中打印删除的词条详情
   if (!deleted_words.empty()) {
-    LOG(INFO) << "Deleted words (" << deleted_words.size() << " items):";
+    LOG(INFO) << "Deleted words (" << deleted_words.size() << " items, threshold: " << clean_threshold << "):";
     for (const auto& word : deleted_words) {
       LOG(INFO) << "  - " << word;
     }
   }
   
-  LOG(INFO) << "Total deleted invalid entries from userdb files: " << delete_item_count;
+  LOG(INFO) << "Total deleted invalid entries from userdb files: " << delete_item_count << " (threshold: " << clean_threshold << ")";
   return delete_item_count;
 }
 
@@ -638,7 +648,7 @@ void send_clean_msg(const int& delete_item_count,
   if (delete_item_count > 0) {
     message = L"用户词典清理完成。\n";
     message += L"删除了 " + std::to_wstring(delete_item_count) + L" 个无效词条。";
-    message += L"\n\n删除的词条已记录到 userdb_cleaner.txt 文件中。";
+    message += L"\n\n删除的词条已记录到同步目录 userdb_cleaner.txt 文件中。";
     
     // 如果启用了完整信息显示，则显示详细信息
     if (full_information_display) {
@@ -798,7 +808,9 @@ void send_clean_msg(const int& delete_item_count,
 /**
  * 执行清理任务
  */
-void process_clean_task(const std::vector<std::string>& cleanup_list, bool full_information_display) {
+void process_clean_task(const std::vector<std::string>& cleanup_list, 
+                       bool full_information_display,
+                       int clean_threshold) {
   LOG(INFO) << "Starting userdb cleaning task...";
   LOG(INFO) << "Cleanup list contains " << cleanup_list.size() << " items";
   if (!cleanup_list.empty()) {
@@ -808,6 +820,7 @@ void process_clean_task(const std::vector<std::string>& cleanup_list, bool full_
     }
   }
   LOG(INFO) << "Full information display: " << full_information_display;
+  LOG(INFO) << "Clean threshold: " << clean_threshold;
   
 #if defined(_WIN32) || defined(_WIN64)
   // 清理前先执行 sync
@@ -820,7 +833,7 @@ void process_clean_task(const std::vector<std::string>& cleanup_list, bool full_
   std::vector<std::string> deleted_words;
   
   int folder_deleted_count = clean_userdb_folders(cleanup_list, cleaned_folders);
-  int file_deleted_count = clean_userdb_files(cleanup_list, cleaned_files, deleted_words);
+  int file_deleted_count = clean_userdb_files(cleanup_list, clean_threshold, cleaned_files, deleted_words);
   
   // 记录删除的词条到日志文件
   fs::path sync_dir = get_sync_directory();
@@ -854,10 +867,12 @@ ProcessResult UserdbCleaner::ProcessKeyEvent(const KeyEvent& key_event) {
     ctx->Clear();
     LOG(INFO) << "UserdbCleaner triggered by input: " << trigger_input_;
     
-    // 启动一个线程来执行清理任务，传递清理列表和显示配置
+    // 启动一个线程来执行清理任务，传递清理列表、显示配置和清理阈值
     DetachedThreadManager manager;
-    if (manager.try_start([cleanup_list = cleanup_userdb_list_, full_display = full_information_display_]() { 
-      process_clean_task(cleanup_list, full_display); 
+    if (manager.try_start([cleanup_list = cleanup_userdb_list_, 
+                          full_display = full_information_display_,
+                          threshold = clean_threshold_]() { 
+      process_clean_task(cleanup_list, full_display, threshold); 
     })) {
       LOG(INFO) << "UserdbCleaner task started successfully";
       return kAccepted;
