@@ -21,6 +21,8 @@ Rime UserDB Cleaner 插件
 在 Rime 配置文件中添加以下配置：
 
 ```yaml
+engine/processors/@before 1: userdb_cleaner
+
 userdb_cleaner:
   trigger_input: "/clean"  # 触发清理的输入字符串，默认为 "/del"
   full_information_display: true  # 是否显示完整清理信息，默认为 false
