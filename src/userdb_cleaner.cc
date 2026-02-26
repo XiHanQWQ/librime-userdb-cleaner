@@ -25,6 +25,10 @@
 #include "lib/detached_thread_manager.hpp"
 #include "userdb_cleaner.hpp"
 
+// 跨平台需要的头文件
+#include <rime/service.h>
+#include <rime/lever/deployment_tasks.h>  // 包含 UserDictSync
+
 namespace fs = std::filesystem;
 
 namespace rime {
@@ -633,15 +637,72 @@ int clean_userdb_files(const std::vector<std::string>& cleanup_list,
   return delete_item_count;
 }
 
+// ---------- 跨平台消息显示函数 ----------
+// 将 UTF-8 字符串进行转义（用于 shell 命令）
+static std::string escape_for_shell(const std::string& s) {
+    std::string result;
+    for (char c : s) {
+        if (c == '\\') result += "\\\\";
+        else if (c == '"') result += "\\\"";
+        else result += c;
+    }
+    return result;
+}
+
+// 跨平台显示消息框（UTF-8 输入）
+static void show_message_utf8(const std::string& title, const std::string& message, bool is_info) {
+#if defined(_WIN32) || defined(_WIN64)
+    // Windows 平台：转换为 UTF-16 并调用 MessageBoxW
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, message.c_str(), -1, nullptr, 0);
+    std::wstring wmessage(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, message.c_str(), -1, &wmessage[0], wlen);
+    wlen = MultiByteToWideChar(CP_UTF8, 0, title.c_str(), -1, nullptr, 0);
+    std::wstring wtitle(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, title.c_str(), -1, &wtitle[0], wlen);
+    MessageBoxW(nullptr, wmessage.c_str(), wtitle.c_str(), MB_OK | (is_info ? MB_ICONINFORMATION : MB_ICONWARNING));
+#elif defined(__APPLE__)
+    // macOS：使用 osascript 显示对话框
+    std::string escaped_title = escape_for_shell(title);
+    std::string escaped_message = escape_for_shell(message);
+    std::string cmd = "osascript -e 'display dialog \"" + escaped_message +
+                      "\" with title \"" + escaped_title +
+                      "\" buttons {\"OK\"} default button \"OK\"' 2>/dev/null";
+    if (system(cmd.c_str()) != 0) {
+        LOG(INFO) << "Failed to show dialog, fallback to log: " << title << " - " << message;
+    }
+#elif defined(__linux__)
+    // Linux：尝试 zenity → kdialog → notify-send → log
+    std::string escaped_title = escape_for_shell(title);
+    std::string escaped_message = escape_for_shell(message);
+    if (system("which zenity > /dev/null 2>&1") == 0) {
+        std::string cmd = "zenity --info --title=\"" + escaped_title +
+                          "\" --text=\"" + escaped_message + "\" 2>/dev/null";
+        if (system(cmd.c_str()) == 0) return;
+    }
+    if (system("which kdialog > /dev/null 2>&1") == 0) {
+        std::string cmd = "kdialog --title \"" + escaped_title +
+                          "\" --msgbox \"" + escaped_message + "\" 2>/dev/null";
+        if (system(cmd.c_str()) == 0) return;
+    }
+    if (system("which notify-send > /dev/null 2>&1") == 0) {
+        std::string cmd = "notify-send \"" + escaped_title +
+                          "\" \"" + escaped_message + "\" 2>/dev/null";
+        if (system(cmd.c_str()) == 0) return;
+    }
+    LOG(INFO) << title << ": " << message;
+#endif
+}
+
 /**
  * 发送清理结果通知
  */
-void send_clean_msg(const int& delete_item_count, 
+void send_clean_msg(const int& delete_item_count,
                    const std::vector<std::string>& cleaned_folders,
                    const std::vector<std::string>& cleaned_files,
                    const std::vector<std::string>& deleted_words,
                    bool full_information_display) {
 #if defined(_WIN32) || defined(_WIN64)
+  // Windows 分支保持不变（使用 MessageBoxW）
   std::wstring title = L"用户词典清理工具";
   std::wstring message;
   
@@ -766,49 +827,80 @@ void send_clean_msg(const int& delete_item_count,
   }
   
   MessageBoxW(NULL, message.c_str(), title.c_str(), MB_OK | MB_ICONINFORMATION);
-#elif __APPLE__
-  // macOS 实现
+#else
+  // 非 Windows 平台：使用 UTF-8 消息，调用跨平台显示函数
+  std::string title = "用户词典清理工具";
+  std::ostringstream message;
+
   if (delete_item_count > 0) {
-    LOG(INFO) << "用户词典清理完成。删除了 " << delete_item_count << " 个无效词条。";
+    message << "用户词典清理完成。\n";
+    message << "删除了 " << delete_item_count << " 个无效词条。";
+    message << "\n\n删除的词条已记录到同步目录 userdb_cleaner.txt 文件中。";
+
     if (full_information_display) {
+      message << "\n\n";
+
       if (!cleaned_folders.empty()) {
-        LOG(INFO) << "清理的 userdb 文件夹: " << cleaned_folders.size();
+        message << "清理的 userdb 文件夹:\n";
+        for (size_t i = 0; i < cleaned_folders.size(); ++i) {
+          if (i > 0) message << ", ";
+          message << cleaned_folders[i];
+        }
+        message << "\n\n";
       }
+
       if (!cleaned_files.empty()) {
-        LOG(INFO) << "清理的 userdb.txt 文件: " << cleaned_files.size();
+        message << "清理的 userdb.txt 文件:\n";
+        for (size_t i = 0; i < cleaned_files.size(); ++i) {
+          if (i > 0) message << ", ";
+          message << cleaned_files[i];
+        }
+        message << "\n\n";
       }
+
       if (!deleted_words.empty()) {
-        LOG(INFO) << "删除的词条数量: " << deleted_words.size();
+        message << "删除的词条:\n";
+        for (size_t i = 0; i < deleted_words.size(); ++i) {
+          if (i > 0) {
+            if (i % 5 == 0) message << "\n";
+            else message << ", ";
+          }
+          message << "[ " << deleted_words[i] << " ]";
+        }
       }
     }
   } else {
-    LOG(INFO) << "用户词典清理完成。未找到需要清理的无效词条。";
-  }
-#elif __linux__
-  // Linux 实现
-  if (delete_item_count > 0) {
-    LOG(INFO) << "用户词典清理完成。删除了 " << delete_item_count << " 个无效词条。";
+    message << "用户词典清理完成。\n";
+    message << "未找到需要清理的无效词条。";
+
     if (full_information_display) {
+      message << "\n\n";
       if (!cleaned_folders.empty()) {
-        LOG(INFO) << "清理的 userdb 文件夹: " << cleaned_folders.size();
+        message << "清理的 userdb 文件夹:\n";
+        for (size_t i = 0; i < cleaned_folders.size(); ++i) {
+          if (i > 0) message << ", ";
+          message << cleaned_folders[i];
+        }
+        message << "\n\n";
       }
       if (!cleaned_files.empty()) {
-        LOG(INFO) << "清理的 userdb.txt 文件: " << cleaned_files.size();
-      }
-      if (!deleted_words.empty()) {
-        LOG(INFO) << "删除的词条数量: " << deleted_words.size();
+        message << "清理的 userdb.txt 文件:\n";
+        for (size_t i = 0; i < cleaned_files.size(); ++i) {
+          if (i > 0) message << ", ";
+          message << cleaned_files[i];
+        }
       }
     }
-  } else {
-    LOG(INFO) << "用户词典清理完成。未找到需要清理的无效词条。";
   }
+
+  show_message_utf8(title, message.str(), true);
 #endif
 }
 
 /**
  * 执行清理任务
  */
-void process_clean_task(const std::vector<std::string>& cleanup_list, 
+void process_clean_task(const std::vector<std::string>& cleanup_list,
                        bool full_information_display,
                        int clean_threshold) {
   LOG(INFO) << "Starting userdb cleaning task...";
@@ -823,9 +915,19 @@ void process_clean_task(const std::vector<std::string>& cleanup_list,
   LOG(INFO) << "Clean threshold: " << clean_threshold;
   
 #if defined(_WIN32) || defined(_WIN64)
-  // 清理前先执行 sync
+  // 清理前先执行 sync (Windows 使用 WeaselDeployer)
   LOG(INFO) << "Executing pre-clean deployment...";
   execute_weasel_deployer("/sync");
+#else
+  // macOS/Linux：使用 librime 内部同步任务
+  LOG(INFO) << "Executing pre-clean sync...";
+  Deployer* deployer = rime::Service::instance().deployer();
+  if (deployer) {
+    UserDictSync sync_task;
+    sync_task.Run(deployer);
+  } else {
+    LOG(ERROR) << "Failed to get deployer for sync";
+  }
 #endif
   
   std::vector<std::string> cleaned_folders;
@@ -846,6 +948,12 @@ void process_clean_task(const std::vector<std::string>& cleanup_list,
   // 清理后执行 sync
   LOG(INFO) << "Executing post-clean deployment...";
   execute_weasel_deployer("/sync");
+#else
+  LOG(INFO) << "Executing post-clean sync...";
+  if (deployer) {
+    UserDictSync sync_task;
+    sync_task.Run(deployer);
+  }
 #endif
   
   LOG(INFO) << "Userdb cleaning completed. Total deleted entries: " << file_deleted_count;
@@ -858,6 +966,30 @@ void process_clean_task(const std::vector<std::string>& cleanup_list,
 
 ProcessResult UserdbCleaner::ProcessKeyEvent(const KeyEvent& key_event) {
 #if defined(_WIN32) || defined(_WIN64)
+  auto ctx = engine_->context();
+  auto input = ctx->input();
+  
+  DLOG(INFO) << "UserdbCleaner processing input: " << input << ", trigger: " << trigger_input_;
+  
+  if (input == trigger_input_) {
+    ctx->Clear();
+    LOG(INFO) << "UserdbCleaner triggered by input: " << trigger_input_;
+    
+    // 启动一个线程来执行清理任务，传递清理列表、显示配置和清理阈值
+    DetachedThreadManager manager;
+    if (manager.try_start([cleanup_list = cleanup_userdb_list_, 
+                          full_display = full_information_display_,
+                          threshold = clean_threshold_]() { 
+      process_clean_task(cleanup_list, full_display, threshold); 
+    })) {
+      LOG(INFO) << "UserdbCleaner task started successfully";
+      return kAccepted;
+    } else {
+      LOG(ERROR) << "Failed to start UserdbCleaner task - already running";
+    }
+  }
+#else
+  // 非 Windows 平台同样支持
   auto ctx = engine_->context();
   auto input = ctx->input();
   
