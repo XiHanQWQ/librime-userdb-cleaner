@@ -7,25 +7,26 @@
 #include <rime/schema.h>
 #include <rime_api.h>
 
-#if defined(_WIN32) || defined(_WIN64)
-#include <charconv>
-#include <filesystem>
-#include <fstream>
+// 跨平台必需的头文件
+#include <chrono>
+#include <charconv>      // std::from_chars
+#include <filesystem>    // std::filesystem
+#include <fstream>       // std::ifstream, std::ofstream
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
-#include <windows.h>
 #include <vector>
-#include <cstdlib>  // 用于 system 函数
-#include <chrono>
-#include <iomanip>
-#include <sstream>
+#include <cstdlib>       // std::system
+
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
 #endif
 
 #include "lib/detached_thread_manager.hpp"
 #include "userdb_cleaner.hpp"
 
-// 跨平台需要的头文件
+// Rime 头文件
 #include <rime/service.h>
 #include <rime/lever/deployment_tasks.h>  // 包含 UserDictSync
 
@@ -235,9 +236,13 @@ fs::path get_sync_directory() {
  */
 std::string get_current_time() {
   auto now = std::chrono::system_clock::now();
-  auto time_t = std::chrono::system_clock::to_time_t(now);
+  auto tt = std::chrono::system_clock::to_time_t(now);
   std::tm tm;
-  localtime_s(&tm, &time_t);
+#if defined(_WIN32) || defined(_WIN64)
+  localtime_s(&tm, &tt);
+#else
+  localtime_r(&tt, &tm);
+#endif
   
   std::ostringstream oss;
   oss << std::setfill('0') 
@@ -247,7 +252,7 @@ std::string get_current_time() {
       << std::setw(2) << tm.tm_hour << ":"
       << std::setw(2) << tm.tm_min << ":"
       << std::setw(2) << tm.tm_sec;
-  
+
   return oss.str();
 }
 
@@ -506,12 +511,13 @@ std::vector<fs::path> get_userdb_files(const std::vector<std::string>& cleanup_l
 
 /**
  * 从行中提取 c 值并解析为整数
+ * @return -1 表示未找到 c 字段或解析失败；否则返回解析出的整数值
  */
 int parse_c_value(const std::string& line) {
   // 从后往前查找"c="
   size_t pos = line.rfind("c=");
   if (pos == std::string::npos)
-    return 1;  // 未找到 c 字段, 保留该行
+    return -1;  // 未找到 c 字段, 返回 -1
 
   // 移动到c值起始位置 (跳过"c=")
   pos += 2;
@@ -531,7 +537,7 @@ int parse_c_value(const std::string& line) {
     try {
       return std::stoi(line.substr(pos, end - pos));
     } catch (...) {
-      return 1;  // 解析失败, 保留该行
+      return -1;  // 解析失败, 返回 -1
     }
   }
   return value;
@@ -599,8 +605,8 @@ int clean_userdb_files(const std::vector<std::string>& cleanup_list,
           if (line.empty()) continue;
           // 提取并检查 c 值
           int c_value = parse_c_value(line);
-          // 把 c >= clean_threshold 的行写入新文件
-          if (c_value >= clean_threshold) {
+          // 如果找不到 c 字段（c_value == -1），或者 c 值 >= 阈值，则保留该行
+          if (c_value == -1 || c_value >= clean_threshold) {
             out << line << "\n";
           } else {
             // 记录删除的词条
@@ -914,6 +920,9 @@ void process_clean_task(const std::vector<std::string>& cleanup_list,
   LOG(INFO) << "Full information display: " << full_information_display;
   LOG(INFO) << "Clean threshold: " << clean_threshold;
   
+  // 声明 deployer 指针，用于非 Windows 平台的同步操作
+  Deployer* deployer = nullptr;
+  
 #if defined(_WIN32) || defined(_WIN64)
   // 清理前先执行 sync (Windows 使用 WeaselDeployer)
   LOG(INFO) << "Executing pre-clean deployment...";
@@ -921,7 +930,7 @@ void process_clean_task(const std::vector<std::string>& cleanup_list,
 #else
   // macOS/Linux：使用 librime 内部同步任务
   LOG(INFO) << "Executing pre-clean sync...";
-  Deployer* deployer = rime::Service::instance().deployer();
+  deployer = &rime::Service::instance().deployer();  // 获取指针
   if (deployer) {
     UserDictSync sync_task;
     sync_task.Run(deployer);
