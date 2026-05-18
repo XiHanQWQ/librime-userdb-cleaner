@@ -6,7 +6,9 @@
 #include <mutex>
 #include <thread>
 
-// TODO: 优化
+// Manages at-most-once detached thread execution via shared atomic state.
+// The thread holds a shared_ptr to the state, allowing safe manager destruction
+// while the task runs. State resets on task completion via RAII guard.
 class DetachedThreadManager {
  public:
   // 尝试启动一个分离线程执行任务
