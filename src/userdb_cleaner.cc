@@ -10,6 +10,7 @@
 // 跨平台必需的头文件
 #include <chrono>
 #include <charconv>      // std::from_chars
+#include <cstdint>       // int64_t
 #include <filesystem>    // std::filesystem
 #include <fstream>       // std::ifstream, std::ofstream
 #include <iomanip>
@@ -41,6 +42,9 @@ constexpr size_t kUserdbSuffixLen = 7;
 constexpr size_t kUserdbTxtSuffixLen = 11;
 constexpr const char* kCFieldPrefix = "c=";
 constexpr size_t kCFieldPrefixLen = 2;
+constexpr const char* kTickFieldPrefix = "t=";
+constexpr size_t kTickFieldPrefixLen = 2;
+constexpr const char* kGlobalTickPrefix = "#@/tick\t";
 
 // 检查字符串是否以指定后缀结尾（避免 substr 拷贝）
 inline bool has_suffix(const std::string& str, const char* suffix, size_t suffix_len) {
@@ -114,7 +118,40 @@ void UserdbCleaner::InitializeConfig() {
     LOG(INFO) << "userdb_cleaner/clean_threshold not set, using default: " << clean_threshold_;
   } else {
     LOG(INFO) << "UserdbCleaner clean_threshold: " << clean_threshold_;
-  }  
+  }
+
+  // 读取清理模式配置: "c" (默认), "tick", "c_then_tick"
+  if (!config->GetString("userdb_cleaner/clean_mode", &clean_mode_)) {
+    LOG(INFO) << "userdb_cleaner/clean_mode not set, using default: " << clean_mode_;
+  } else {
+    LOG(INFO) << "UserdbCleaner clean_mode: " << clean_mode_;
+    // 验证模式值
+    if (clean_mode_ != "c" && clean_mode_ != "tick" && clean_mode_ != "c_then_tick") {
+      LOG(WARNING) << "Invalid clean_mode '" << clean_mode_ << "', falling back to 'c'";
+      clean_mode_ = "c";
+    }
+  }
+
+  // 读取 tick 差值清理阈值
+  if (!config->GetInt("userdb_cleaner/tick_threshold", &tick_threshold_)) {
+    LOG(INFO) << "userdb_cleaner/tick_threshold not set, using default: " << tick_threshold_;
+  } else {
+    LOG(INFO) << "UserdbCleaner tick_threshold: " << tick_threshold_;
+  }
+
+  // 读取是否备份
+  if (!config->GetBool("userdb_cleaner/enable_backup", &enable_backup_)) {
+    LOG(INFO) << "userdb_cleaner/enable_backup not set, using default: " << enable_backup_;
+  } else {
+    LOG(INFO) << "UserdbCleaner enable_backup: " << enable_backup_;
+  }
+
+  // 读取是否写入清理文件
+  if (!config->GetBool("userdb_cleaner/enable_write_clean_file", &enable_write_clean_file_)) {
+    LOG(INFO) << "userdb_cleaner/enable_write_clean_file not set, using default: " << enable_write_clean_file_;
+  } else {
+    LOG(INFO) << "UserdbCleaner enable_write_clean_file: " << enable_write_clean_file_;
+  }
 }
 
 #ifdef _WIN32
@@ -258,6 +295,89 @@ std::string get_current_time() {
       << std::setw(2) << tm.tm_sec;
 
   return oss.str();
+}
+
+/**
+ * 从 .userdb.txt 文件头部读取全局 tick 值 (#@/tick)
+ * @return -1 表示未找到或读取失败
+ */
+int64_t read_global_tick(const fs::path& file_path) {
+  std::ifstream in(file_path, std::ios::binary);
+  if (!in.is_open()) return -1;
+
+  std::string line;
+  line.reserve(256);
+  while (std::getline(in, line)) {
+    if (line.empty()) continue;
+    // 只检查头部元数据行 (#@/ 开头)
+    if (line.rfind("#@/", 0) != 0) break;  // 不再是头部行，停止扫描
+
+    if (line.rfind(kGlobalTickPrefix, 0) == 0) {
+      // 提取 \t 之后的值
+      size_t val_pos = line.find('\t');
+      if (val_pos == std::string::npos) return -1;
+      int64_t value = -1;
+      std::from_chars(line.data() + val_pos + 1,
+                      line.data() + line.size(), value);
+      return value;
+    }
+  }
+  return -1;
+}
+
+/**
+ * 备份并删除 sync_dir 中当前用户的 .userdb.txt 文件，
+ * 以阻止 Synchronize 的 Restore(Merger) 步骤将所有词条的 tick 统一刷成总 tick。
+ * 只处理当前用户的同步目录，不影响其他设备的同步数据。
+ */
+void clean_sync_user_files(const fs::path& sync_dir, const std::string& current_user_id) {
+  if (current_user_id.empty()) {
+    LOG(INFO) << "No current user_id available, skipping sync cleanup";
+    return;
+  }
+
+  // sync 目录结构: sync/{user_id}/*.userdb.txt
+  fs::path user_sync_dir = sync_dir / current_user_id;
+  if (!fs::exists(user_sync_dir) || !fs::is_directory(user_sync_dir)) {
+    LOG(INFO) << "Sync user directory not found: " << user_sync_dir.string();
+    return;
+  }
+
+  int renamed = 0;
+
+  for (const auto& entry : fs::directory_iterator(user_sync_dir)) {
+    try {
+      if (!entry.is_regular_file()) continue;
+      const auto& path = entry.path();
+      std::string filename = path.filename().string();
+      if (!has_suffix(filename, kUserdbTxtSuffix, kUserdbTxtSuffixLen)) continue;
+
+      // 直接重命名为 .userdb_backup.txt，减少 IO
+      std::string backup_name = filename;
+      size_t pos = backup_name.find(kUserdbTxtSuffix);
+      if (pos != std::string::npos) {
+        backup_name.replace(pos, kUserdbTxtSuffixLen, ".userdb_backup.txt");
+      } else {
+        backup_name += ".backup";
+      }
+      fs::path backup_path = user_sync_dir / backup_name;
+
+      // 如果旧备份存在则先删除（Windows 上 rename 不允许覆盖目标）
+      if (fs::exists(backup_path)) {
+        fs::remove(backup_path);
+      }
+      fs::rename(path, backup_path);
+      renamed++;
+      LOG(INFO) << "Renamed sync file to prevent tick reset: "
+                << filename << " -> " << backup_name;
+    } catch (const fs::filesystem_error& e) {
+      LOG(ERROR) << "Failed to process sync file " << entry.path().string()
+                  << ": " << e.what();
+    }
+  }
+
+  LOG(INFO) << "Sync directory cleanup complete for user '" << current_user_id
+            << "': renamed " << renamed << " .userdb.txt files";
 }
 
 /**
@@ -514,6 +634,30 @@ int parse_c_value(const std::string& line) {
 }
 
 /**
+ * 从行中提取 t 值并解析为整数
+ * @return -1 表示未找到 t 字段或解析失败；否则返回解析出的整数值
+ */
+int64_t parse_tick_value(const std::string& line) {
+  size_t pos = line.rfind(kTickFieldPrefix);
+  if (pos == std::string::npos)
+    return -1;
+
+  pos += kTickFieldPrefixLen;
+
+  size_t end = pos;
+  while (end < line.size() &&
+         !std::isspace(static_cast<unsigned char>(line[end]))) {
+    end++;
+  }
+
+  if (end == pos) return -1;  // no value after "t="
+
+  int64_t value = -1;
+  std::from_chars(line.data() + pos, line.data() + end, value);
+  return value;
+}
+
+/**
  * 从词条行中提取词条文本
  * 格式示例: biàn biàn 	便便	c=1 d=0.00687406 t=31469
  * 返回: 便便
@@ -542,6 +686,10 @@ std::string extract_word_text(const std::string& line) {
  */
 int clean_userdb_files(const std::unordered_set<std::string>& cleanup_set, 
                       int clean_threshold,
+                      int tick_threshold,
+                      const std::string& clean_mode,
+                      bool enable_backup,
+                      bool enable_write_clean_file,
                       std::vector<std::string>& cleaned_files, 
                       std::vector<std::string>& deleted_words) {
   auto files = get_userdb_files(cleanup_set, cleaned_files);
@@ -554,14 +702,76 @@ int clean_userdb_files(const std::unordered_set<std::string>& cleanup_set,
     for (const auto& file : files) {
       LOG(INFO) << "Processing file: " << file.string();
       
-      // 备份文件
-      if (!backup_userdb_file(file)) {
-        LOG(ERROR) << "Failed to backup file: " << file.string();
-        // 继续处理，但不记录删除的词条
-        continue;
+      // 读取该文件的全局 tick（tick 和 c_then_tick 模式需要）
+      int64_t global_tick = -1;
+      if (clean_mode == "tick" || clean_mode == "c_then_tick") {
+        global_tick = read_global_tick(file);
+        if (global_tick < 0) {
+          LOG(WARNING) << "Could not read global tick from " << file.string()
+                       << ", skipping tick-based cleaning for this file";
+        } else {
+          LOG(INFO) << "File " << file.filename().string()
+                    << " global tick: " << global_tick;
+        }
       }
       
-      if (fs::exists(file) && fs::is_regular_file(file)) {
+      // 备份文件
+      if (enable_backup) {
+        if (!backup_userdb_file(file)) {
+          LOG(ERROR) << "Failed to backup file: " << file.string();
+          // 继续处理（仅 skip 该文件），但不记录删除的词条
+          continue;
+        }
+      } else {
+        LOG(INFO) << "Backup disabled, skipping backup for " << file.filename().string();
+      }
+      
+      if (!fs::exists(file) || !fs::is_regular_file(file)) {
+        LOG(ERROR) << "File not found or not regular: " << file.string();
+        continue;
+      }
+
+      int file_deleted_count = 0;
+
+      if (!enable_write_clean_file) {
+        // 不写文件模式：只扫描统计，不修改文件
+        std::ifstream in(file, std::ios::binary);
+        if (!in.is_open()) {
+          LOG(ERROR) << "Failed to open file for scanning: " << file.string();
+          continue;
+        }
+
+        while (std::getline(in, line)) {
+          if (line.empty()) continue;
+
+          bool should_delete = false;
+          if (clean_mode == "c") {
+            int c_value = parse_c_value(line);
+            should_delete = (c_value != -1 && c_value < clean_threshold);
+          } else if (clean_mode == "tick" && global_tick >= 0) {
+            int64_t t_value = parse_tick_value(line);
+            should_delete = (t_value >= 0 && (global_tick - t_value > tick_threshold));
+          } else if (clean_mode == "c_then_tick" && global_tick >= 0) {
+            int c_value = parse_c_value(line);
+            if (c_value != -1 && c_value < clean_threshold) {
+              should_delete = true;
+            } else {
+              int64_t t_value = parse_tick_value(line);
+              should_delete = (t_value >= 0 && (global_tick - t_value > tick_threshold));
+            }
+          }
+
+          if (should_delete) {
+            std::string word_text = extract_word_text(line);
+            deleted_words.push_back(word_text);
+            delete_item_count++;
+            file_deleted_count++;
+          }
+        }
+        in.close();
+
+      } else {
+        // 写文件模式：读取、过滤、写回
         std::ifstream in(file, std::ios::binary);
         std::string temp_file = file.string() + ".cache";
         std::ofstream out(temp_file, std::ios::binary);
@@ -570,20 +780,47 @@ int clean_userdb_files(const std::unordered_set<std::string>& cleanup_set,
           continue;
         }
 
-        int file_deleted_count = 0;
+        bool past_header = false;
         while (std::getline(in, line)) {
-          if (line.empty()) continue;
-          // 提取并检查 c 值
-          int c_value = parse_c_value(line);
-          // 如果找不到 c 字段（c_value == -1），或者 c 值 >= 阈值，则保留该行
-          if (c_value == -1 || c_value >= clean_threshold) {
-            out << line << "\n";
-          } else {
-            // 记录删除的词条
+          if (!past_header) {
+            // 复制头部行（空行或 #@/ 开头的元数据行）
+            if (line.empty() || line.rfind("#@/", 0) == 0) {
+              out << line << "\n";
+              continue;
+            }
+            past_header = true;
+          }
+
+          // 数据部分
+          if (line.empty()) {
+            out << line << "\n";  // 保留数据区的空行
+            continue;
+          }
+
+          bool should_delete = false;
+          if (clean_mode == "c") {
+            int c_value = parse_c_value(line);
+            should_delete = (c_value != -1 && c_value < clean_threshold);
+          } else if (clean_mode == "tick" && global_tick >= 0) {
+            int64_t t_value = parse_tick_value(line);
+            should_delete = (t_value >= 0 && (global_tick - t_value > tick_threshold));
+          } else if (clean_mode == "c_then_tick" && global_tick >= 0) {
+            int c_value = parse_c_value(line);
+            if (c_value != -1 && c_value < clean_threshold) {
+              should_delete = true;
+            } else {
+              int64_t t_value = parse_tick_value(line);
+              should_delete = (t_value >= 0 && (global_tick - t_value > tick_threshold));
+            }
+          }
+
+          if (should_delete) {
             std::string word_text = extract_word_text(line);
             deleted_words.push_back(word_text);
             delete_item_count++;
             file_deleted_count++;
+          } else {
+            out << line << "\n";
           }
         }
 
@@ -592,25 +829,30 @@ int clean_userdb_files(const std::unordered_set<std::string>& cleanup_set,
         in.close();
 
         try {
-            fs::remove(file);
-            fs::rename(temp_file, file);
+          fs::remove(file);
+          fs::rename(temp_file, file);
         } catch (const fs::filesystem_error& e) {
-            LOG(ERROR) << "Failed to replace file " << file.string() << ": " << e.what();
+          LOG(ERROR) << "Failed to replace file " << file.string() << ": " << e.what();
         }
-        LOG(INFO) << "File " << file.filename().string() << ": deleted " << file_deleted_count << " invalid entries (threshold: " << clean_threshold << ")";
       }
+
+      LOG(INFO) << "File " << file.filename().string() << ": deleted " << file_deleted_count
+                << " invalid entries (mode: " << clean_mode
+                << ", threshold: " << clean_threshold << ")";
     }
   }
   
   // 在日志中打印删除的词条详情
   if (!deleted_words.empty()) {
-    LOG(INFO) << "Deleted words (" << deleted_words.size() << " items, threshold: " << clean_threshold << "):";
+    LOG(INFO) << "Deleted words (" << deleted_words.size() << " items, mode: " << clean_mode
+              << ", threshold: " << clean_threshold << "):";
     for (const auto& word : deleted_words) {
       LOG(INFO) << "  - " << word;
     }
   }
   
-  LOG(INFO) << "Total deleted invalid entries from userdb files: " << delete_item_count << " (threshold: " << clean_threshold << ")";
+  LOG(INFO) << "Total deleted invalid entries from userdb files: " << delete_item_count
+            << " (mode: " << clean_mode << ", threshold: " << clean_threshold << ")";
   return delete_item_count;
 }
 
@@ -777,7 +1019,11 @@ static void execute_sync() {
  */
 void process_clean_task(const std::vector<std::string>& cleanup_list,
                        bool full_information_display,
-                       int clean_threshold) {
+                       int clean_threshold,
+                       int tick_threshold,
+                       const std::string& clean_mode,
+                       bool enable_backup,
+                       bool enable_write_clean_file) {
   LOG(INFO) << "Starting userdb cleaning task...";
   LOG(INFO) << "Cleanup list contains " << cleanup_list.size() << " items";
   if (!cleanup_list.empty()) {
@@ -788,7 +1034,26 @@ void process_clean_task(const std::vector<std::string>& cleanup_list,
   }
   LOG(INFO) << "Full information display: " << full_information_display;
   LOG(INFO) << "Clean threshold: " << clean_threshold;
-  
+  LOG(INFO) << "Clean mode: " << clean_mode;
+  LOG(INFO) << "Tick threshold: " << tick_threshold;
+  LOG(INFO) << "Enable backup: " << enable_backup;
+  LOG(INFO) << "Enable write clean file: " << enable_write_clean_file;
+
+  // 获取同步目录和当前用户 ID
+  fs::path sync_dir = get_sync_directory();
+
+  // 同步前：将 sync_dir 中当前用户的 .userdb.txt 重命名为 .userdb_backup.txt，
+  // 阻止 Synchronize 的 Restore(Merger) 步骤将旧数据覆盖回本地
+  {
+    std::string current_user_id = rime::Service::instance().deployer().user_id;
+
+    if (!current_user_id.empty()) {
+      clean_sync_user_files(sync_dir, current_user_id);
+    } else {
+      LOG(WARNING) << "Could not determine current user_id, skipping sync cleanup";
+    }
+  }
+
   // Pre-clean sync
   LOG(INFO) << "Executing pre-clean sync...";
   execute_sync();
@@ -800,10 +1065,12 @@ void process_clean_task(const std::vector<std::string>& cleanup_list,
   std::vector<std::string> deleted_words;
   
   int folder_deleted_count = clean_userdb_folders(cleanup_set, cleaned_folders);
-  int file_deleted_count = clean_userdb_files(cleanup_set, clean_threshold, cleaned_files, deleted_words);
+  int file_deleted_count = clean_userdb_files(cleanup_set, clean_threshold, tick_threshold,
+                                               clean_mode, enable_backup,
+                                               enable_write_clean_file,
+                                               cleaned_files, deleted_words);
   
   // 记录删除的词条到日志文件
-  fs::path sync_dir = get_sync_directory();
   log_deleted_words(deleted_words, sync_dir);
   
   // Post-clean sync
@@ -832,8 +1099,13 @@ ProcessResult UserdbCleaner::ProcessKeyEvent(const KeyEvent& key_event) {
     DetachedThreadManager manager;
     if (manager.try_start([cleanup_list = cleanup_userdb_list_, 
                           full_display = full_information_display_,
-                          threshold = clean_threshold_]() { 
-      process_clean_task(cleanup_list, full_display, threshold); 
+                          threshold = clean_threshold_,
+                          tick_thresh = tick_threshold_,
+                          mode = clean_mode_,
+                          backup = enable_backup_,
+                          write_file = enable_write_clean_file_]() { 
+      process_clean_task(cleanup_list, full_display, threshold,
+                         tick_thresh, mode, backup, write_file); 
     })) {
       LOG(INFO) << "UserdbCleaner task started successfully";
       return kAccepted;
