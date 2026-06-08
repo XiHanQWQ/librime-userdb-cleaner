@@ -491,25 +491,34 @@ std::vector<fs::path> get_userdb_files(const std::unordered_set<std::string>& cl
 
 /**
  * 从行中提取 c 值并解析为整数
- * @return -1 表示未找到 c 字段或解析失败；否则返回解析出的整数值
+ * 若解析失败则返回 0 并记录错误。
  */
 int parse_c_value(const std::string& line) {
   size_t pos = line.rfind(kCFieldPrefix);
-  if (pos == std::string::npos)
-    return -1;
+  if (pos == std::string::npos) {
+    LOG(ERROR) << "No c= field found in line: " << line;
+    return 0;
+  }
 
   pos += kCFieldPrefixLen;
 
   size_t end = pos;
-  while (end < line.size() &&
-         !std::isspace(static_cast<unsigned char>(line[end]))) {
+  while (end < line.size() && !std::isspace(static_cast<unsigned char>(line[end]))) {
     end++;
   }
 
-  if (end == pos) return -1;  // no value after "c="
+  if (end == pos) {
+    LOG(ERROR) << "Empty c= value in line: " << line;
+    return 0;
+  }
 
-  int value = -1;
-  std::from_chars(line.data() + pos, line.data() + end, value);
+  int value = 0;
+  auto [ptr, ec] = std::from_chars(line.data() + pos, line.data() + end, value);
+  if (ec != std::errc()) {
+    LOG(ERROR) << "Failed to parse c value in line: " << line;
+    return 0;
+  }
+
   return value;
 }
 
@@ -573,17 +582,22 @@ int clean_userdb_files(const std::unordered_set<std::string>& cleanup_set,
         int file_deleted_count = 0;
         while (std::getline(in, line)) {
           if (line.empty()) continue;
-          // 提取并检查 c 值
-          int c_value = parse_c_value(line);
-          // 如果找不到 c 字段（c_value == -1），或者 c 值 >= 阈值，则保留该行
-          if (c_value == -1 || c_value >= clean_threshold) {
+          
+          // 保留所有以 '#' 开头的行（元数据/注释）
+          if (!line.empty() && line[0] == '#') {
             out << line << "\n";
-          } else {
-            // 记录删除的词条
+            continue;
+          }
+          
+          // 提取 c 值（词条行应该包含 c= 字段）
+          int c_value = parse_c_value(line);
+          if (c_value < clean_threshold) {
             std::string word_text = extract_word_text(line);
             deleted_words.push_back(word_text);
             delete_item_count++;
             file_deleted_count++;
+          } else {
+            out << line << "\n";
           }
         }
 
