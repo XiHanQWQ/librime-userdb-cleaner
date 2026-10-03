@@ -1,88 +1,124 @@
 # Rime UserDB Cleaner 插件
 
-这是一个 Rime 输入法的自定义插件，用于清理用户词典中很少使用的词条（基于 `c=` 字段的阈值判断）。
+一个 Rime 处理器插件：通过输入触发码，物理删除用户词典中已无用的词条，并同步清理所有设备同步目录下的 `.userdb.txt` 快照，防止已删除词条在后续同步中被重新合并。
 
-## 功能特性
+## 核心特性
 
-- **就地清理用户词典**：直接遍历 LevelDb，把 `c < clean_threshold` 的词条物理 `Erase` 掉（含 `c` 为负值的删除标记行），不会删除或清空 `.userdb` 目录，不影响输入法正常使用
-- **清理同步快照**：删除同步目录下 `.userdb.txt` 文件中 `c < clean_threshold` 的词条行，避免下次同步时把刚清理掉的词条合并回来
-- **清理前后各同步一次**：旧快照先改名备份，「重建快照同步」基于清理后的本地词典重新生成快照，清理后再「收尾同步」；进程内调用 librime 的 `installation_update` + `user_dict_sync` 任务，不调用 WeaselDeployer 外部进程
-- 支持按词典名称过滤，**通过黑名单跳过指定的 userdb**，其余词典照常清理
-- 支持简略和详细两种清理结果通知模式
-- 同步前把旧快照 `.userdb.txt` 改名保留为 `.userdb_backup.txt`（同名覆盖旧备份）；清理新快照时先写临时文件再原子替换
-- 把删除的词条**全部**记入同步目录的 `userdb_cleaner.txt` 日志文件（每行 10 条）
-- 清理在独立线程中运行，不会阻塞输入法界面；同一时刻只允许一次清理任务
+- **原地物理删除**：直接遍历本地 LevelDB（`<name>.userdb` 目录）或 `plain_userdb`（`<name>.userdb.txt` 文件），对满足条件的词条调用 `Db::Erase` 进行物理删除，不删除或清空词典本身。
+- **全量快照清理**：递归清理同步目录下所有设备目录中的 `*.userdb.txt` 快照（非仅本机），采用“先写临时文件、再原子替换”策略。
+- **同步-清理-同步流程**：在插件进程内调用 librime 的 `installation_update` 与 `user_dict_sync`，不依赖 WeaselDeployer 外部进程。
+- **判据与 librime 一致**：使用 `UserDictionary::CreateDictEntry` 判断词条是否仍可被检索，避免硬编码阈值和衰减公式，确保与 librime 升级同步。
+- **完整审计追踪**：rime 日志逐条记录删除词条；同步目录下的 `userdb_cleaner.txt` 记录全部删除词条（弹窗仅显示前 10 条及总数）。
+- **运行防护**：通过同步目录下的 `.userdb_cleaner.lock` 保证单任务运行；日志超过 2 MB 自动轮转；自动清理崩溃残留的 `*.userdb.txt.tmp`。
+- **灵活配置**：支持词典黑名单过滤、简略/详细弹窗模式，清理过程在独立线程执行，不阻塞输入。
 
-## 安装配置
+## 删除判定标准
+
+本地词典与所有快照文件使用同一套判定规则，确保一致性：
+
+1. **`c < clean_threshold`**：`c` 为提交次数，严格小于阈值时删除。默认 `0` 仅删除 `c` 为负的删除标记行；设为 `1` 会同时删除从未使用过的 `c = 0` 词条。
+2. **librime 判定为不可见**：调用 `UserDictionary::CreateDictEntry(key, value, present_tick)`，返回空表示该词条永远不会被输入法检索到，无论 `c` 值大小均删除。`present_tick` 取本机该词典的 `/tick`；若本地词典无法打开，则回退使用快照文件头中的 `#@/tick`。
+
+以下两类行不受判定影响：
+
+- **`t = 0` 的行**：从 table/stabledb 导入的短语（如 `custom_phrase`），librime 从不进行衰减淘汰，因此一律保留。
+- **无法解析 `c/d/t` 的行**：一律保留，但会计数并在弹窗与日志中报告，避免因格式变化导致静默失效。
+
+## 清理流程
+
+1. **清理前同步**：合并 `sync/` 下所有设备目录的快照至本地词典，再将本地词典全量导出为本机的 `*.userdb.txt`。
+2. **备份本机快照**：将 `sync/<本机 installation_id>/*.userdb.txt` 复制为同目录下的 `*.userdb_backup.txt`（覆盖旧备份；仅复制不移动，其他设备目录不受影响）。此步骤须在同步之后执行，因为 `user_data_sync_dir() = sync_dir / user_id` 依赖 `installation_update` 的结果。
+3. **清理本地词典**：扫描用户数据目录，按黑名单过滤，使用 `QueryAll` 原始游标逐行判定，命中则直接 `Erase`（包括第 1 步合并进来的其他设备词条）。
+4. **清理同步快照**：对 `sync/` 下所有 `*.userdb.txt` 删除同样判定的行，并清理残留的 `*.userdb.txt.tmp`。
+5. **清理后同步**：合并已清理的快照并再次导出，确保发布出去的快照与本地状态一致。
+
+整个流程由 `sync` 目录根下的 `.userdb_cleaner.lock` 保护，同一时刻仅允许一个清理任务运行。
+
+## 安装与配置
 
 ### 1. 编译插件
 
-将插件源代码编译为 Rime 插件模块，确保链接到 Rime 核心库。
+将插件编译为 Rime 插件模块，确保链接 Rime 核心库（`UserDictionary::CreateDictEntry` 为 `RIME_DLL` 导出符号）。
 
-### 2. 配置 Rime 配置文件（如 `default.custom.yaml` 或具体方案的 `.schema.yaml`）
-
-在目标的 Rime 方案（schema）中添加以下配置：
+### 2. 配置方案文件（如 `*.schema.yaml`）
 
 ```yaml
 engine/processors:
-  - userdb_cleaner    # 添加在 speller 之后
+  - userdb_cleaner                      # 置于 speller 之后
 
 userdb_cleaner:
-  trigger_input: "/clean"               # 触发清理的输入字符串，默认 "/del"
-  full_information_display: true        # 是否显示完整清理信息，默认 false
+  trigger_input: "/clean"               # 触发清理的输入串，默认 "/del"
   clean_threshold: 1                    # 删除条件：c < clean_threshold，默认 0
-  exclude_userdb_list:                  # 黑名单：不参与清理的词典，未设置或为空时清理所有
-    - 词典名称1
-    - 词典名称2
+  full_information_display: true        # 弹窗是否显示详细信息，默认 false
+  exclude_userdb_list: []               # 黑名单：不参与清理的词典，空 = 全部清理
 ```
 
-或者使用列表语法：
+黑名单也可使用列表语法：
 
 ```yaml
 userdb_cleaner:
-  exclude_userdb_list: ["词典名称1", "词典名称2"]
+  exclude_userdb_list: ["rime_sheep_pro", "custom"]
 ```
 
-### 3. 配置项详细说明
+### 3. 配置项说明
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `trigger_input` | 字符串 | `"/del"` | 在输入法中输入该字符串后触发清理；设为空字符串则永不触发 |
-| `full_information_display` | 布尔 | `false` | `false` 时仅显示删除统计；`true` 时额外显示扫描的快照数、涉及的词典与文件、以及被删除的词条（最多列 10 条，旁边标出删除总条数） |
-| `clean_threshold` | 整数 | `0` | 删除条件：`c < clean_threshold`。找不到 `c=` 字段的行一律保留。实时词典与同步快照都按此条件处理，`c` 为负值（删除标记）的行在阈值大于该负值时也会被删除 |
-| `exclude_userdb_list` | 字符串数组 | 空（清理所有） | **黑名单**：指定不参与清理的词典名称，可带或不带 `.userdb` / `.userdb.txt` 后缀。例如 `["rime_sheep_pro", "custom"]` 表示跳过这两个，清理其余全部 |
+| `trigger_input` | 字符串 | `"/del"` | 输入该串后触发清理；设为空字符串则永不触发 |
+| `clean_threshold` | 整数 | `0` | 删除条件 `c < clean_threshold`；此外，无论阈值多少，librime 判定为不可见的行一样会被清除。`t = 0` 的短语行一律保留，无法解析 `c/d/t` 的行保留并计数上报 |
+| `full_information_display` | 布尔 | `false` | `false` 仅显示统计信息；`true` 额外显示扫描/备份数量、处理的词典与文件、删除的词条（最多 10 条，并标注总数） |
+| `exclude_userdb_list` | 字符串数组 | 空（全部清理） | **黑名单**：不参与清理的词典名，可带或不带 `.userdb` / `.userdb.txt` 后缀。作用于本地清理、快照备份与快照清理；黑名单词典的快照既不备份也不清理，但同步仍会合并它们 |
 
-## 使用说明
+## 输出说明
 
-1. 在 Rime 输入法处于可输入状态时，键入配置的触发字符串（默认 `/del`），输入法会清空当前输入并启动清理任务。
-2. 清理任务在后台线程中按顺序执行：
-   1. **清理本地词典**：先关闭所有输入会话（活动会话持有 `.userdb` 文件锁），再扫描用户数据目录下的 `*.userdb`，按 `exclude_userdb_list` 黑名单过滤；对每本词典用 `QueryAll` 原始遍历，把 `c < clean_threshold` 的词条（含负值标记行）物理 `Erase`
-   2. **旧快照改名备份**：把同步目录下的 `*.userdb.txt` 改名为同目录的 `*.userdb_backup.txt`（覆盖旧备份，黑名单词典的快照跳过、保持不变）
-   3. **重建快照同步**：进程内调用 `installation_update` + `user_dict_sync`；旧快照已不在，不会合并旧数据，直接基于清理后的本地词典导出生成全新的 `.userdb.txt`
-   4. **清理新快照**：对刚生成的 `*.userdb.txt` 删除 `c < clean_threshold` 的词条行；先写临时文件再原子替换
-   5. **收尾同步**：合并清理后的快照并再次导出，确认没有词条被合并回来
-3. 把删除记录、改名数量与两次同步结果追加到同步目录的 `userdb_cleaner.txt`。
-4. 清理完成后弹出消息框通知结果（Windows 使用原生 MessageBox，macOS 使用 osascript，Linux 依次尝试 zenity / kdialog / notify-send，均不可用时写入日志）。
+**弹窗通知**（Windows 使用原生 MessageBox，macOS 使用 osascript，Linux 依次尝试 zenity / kdialog / notify-send，均不可用时写入日志）
 
-## 删除方式说明
+- 默认：清理完成 → 用户词典移除数、同步快照删除行数、耗时、删除记录文件路径，以及两次同步结果。
+- 若存在跳过行，追加一行：`跳过 N 行 t=0 短语、N 行无法解析的行`。
+- `full_information_display: true` 时额外显示：已扫描快照数、备份的本机快照数、处理的词典/文件列表、删除的词条（最多 10 条，标题旁标注 `( N条 )` 总数）。
+- 无法获取运行锁时，仅提示「另一个清理任务正在运行」。
 
-词条会从 LevelDb 中**物理移除**（`Db::Erase`），而不是 Rime 默认的“标记为删除”（把 `c` 改为负值）：
+**rime 日志**：每个被删除的词条记录一行，例如：
 
-- 输入法不会再检索到这些词条，同步快照里也不会再有对应的行
-- 本地不留删除标记行 → 同步全量导出的快照里没有它们 → 下次运行不会再重复上报同一批词
-- 代价：删除标记不再跨设备传播。其他设备同步过来的同名词条会重新出现（再用 `/del` 删一次即可）
+```
+userdb cleaner: erased '星露谷' from 'rime_sheep_pro' (xlg 	星露谷).
+userdb cleaner: removed row 'xlg 	星露谷	c=15936696 d=1 t=1' from 'rime_sheep_pro.userdb.txt'.
+```
+
+**`sync/userdb_cleaner.txt`**：每次有效运行追加「时间戳 + 统计 + 全部被删除的词条」（每行 10 条，同一词条仅记录一次）；文件超过 2 MB 时轮转为 `userdb_cleaner.txt.1`。
+
+## 手工置顶短语（Lua pin 等）
+
+若通过 Lua 直接向 userdb 写入置顶短语，例如：
+
+```lua
+pin_db:update(key, "c=" .. encoded_commit .. " d=0 t=1")
+```
+
+**`d = 0` 会被判定为“不可见”并直接清除**，原因如下：
+
+- 当 `t != 0` 时，衰减公式为 `d * exp((t - present)/200)`，`d = 0` 恒为 0，必然 `<= kDiscardThreshold`。
+- 同步合并会将行的 `t` 重写为当前 tick（`UserDbMerger::Put` 中 `o.tick = max_tick_`），因此 `d = 0` 的行在同步一次后即失效，即使写 `t = 0` 也无法保留。
+
+正确做法是给 `d` 一个正数（排名由 `c` 决定，`d` 仅决定是否被淘汰）：
+
+```lua
+pin_db:update(key, "c=" .. encoded_commit .. " d=1 t=1")
+```
 
 ## 注意事项
 
-- 清理任务在独立线程中运行，不会阻塞输入法界面；触发时若上一次清理尚未结束，本次请求会被忽略。
-- `clean_threshold` 是**严格小于**的比较条件：`c < clean_threshold` 才会删除。实时 `.userdb` 与同步快照 `.userdb.txt` 各自独立判断，判断条件相同：
-  - 默认值 `0`：只删除 `c` 为负值的删除标记行，正向词条（`c >= 0`）全部保留。
-  - 设为正整数，例如 `1`：删除所有 `c < 1` 的条目，**包括 `c` 为负值的删除标记行**，即从未使用过的 `c = 0` 词条也会被清掉。
-  - 本地遍历走 `QueryAll` 原始游标，librime 在 `CreateDictEntry` 里的过滤（负值、过期衰减）对判断不生效。想保留删除标记行只能把阈值设成负值，但那样正向词条也全部不清理，等同于关闭功能。
-- `exclude_userdb_list` 为**黑名单**：列出的词典会被跳过，未列出的词典都会被清理。列表为空时清理所有词典。它同时作用于实时 `.userdb` 的清理、快照的改名备份与新快照的清理；黑名单词典的快照保持原样，重建快照同步照常合并它们。
-- 同步前旧快照 `.userdb.txt` 会改名为同目录的 `*.userdb_backup.txt`（同名覆盖上一次的备份），旧快照内容保留在该文件中；新快照清理时不再另行复制备份，因为它的内容随时可由同步重新导出。
-- 日志文件 `userdb_cleaner.txt` 位于同步目录（`sync_dir`）中，可通过 Rime 安装配置中的 `sync_dir` 找到；日志记录**全部**被删除的词条（每行 10 条），弹窗只在 `full_information_display: true` 时列出前 10 条并标出删除总条数。
-- 同步在插件进程内完成（`installation_update` + `user_dict_sync` 任务），是纯本地的 LevelDb 与文件操作，不联网、不调用 WeaselDeployer 外部进程，通常耗时不到 1 秒。
-- 清理本地词典与每次同步前都会先关闭所有输入会话（与官方 `RimeSyncUserData` 做法一致）：活动会话持有 `.userdb` 文件锁，不关闭则插件与同步都无法打开词典（Windows 下报 `LOCK: 另一个程序正在使用此文件`）。代价是此刻正在输入的拼音串会被重置，前端会自动重建会话。
-- 某次同步失败不会中止清理：任务继续执行，失败结果记入 `userdb_cleaner.txt` 日志并在弹窗中显示"重建快照同步/收尾同步：失败"。
+- **物理删除不可逆，插件不备份本地词典**。唯一的回滚手段是第 2 步生成的 `sync/<本机 installation_id>/*.userdb_backup.txt`（清理前的快照）：将其重命名为 `*.userdb.txt` 后再次触发同步，词条会合并回本地。注意合并为“只增不减”，回滚会带回备份中的所有词条。
+- 清理与同步均需释放 `.userdb` 文件锁：两次同步各自会先关闭所有输入会话（遵循官方 `RimeSyncUserData` 做法），本地清理仅在无法打开词典时再关闭一次。关闭会话会重置当前正在输入的拼音串，前端随后会自动重建。
+- 同步与清理均在插件进程内完成，为纯本地 LevelDB 与文件操作，不联网、不调用 WeaselDeployer 外部进程，通常耗时低于 1 秒。
+- 单次同步失败不会中止清理：失败结果记入日志，并在弹窗显示「清理前同步 / 清理后同步：失败」。
 - 无法打开的词典会被跳过并记入日志，不会中断整体清理。
+- 运行锁为同步目录根下的 `.userdb_cleaner.lock`：获取失败则跳过本轮；超过 10 分钟视为陈锁自动接管。云盘同步存在延迟且 mtime 不一定保留，跨设备互斥仅为尽力而为。
+- 清理任务在独立线程中运行，若上一次尚未结束，本次请求将被忽略。
+
+## 已知限制
+
+- **跨设备删除传播失效**：本地不再保留墓碑行，在其他设备上通过 `/del` 删除的词条，本机无法收到删除标记，会以正数 `c` 合并回来（需在该设备上也执行删除）。
+- **未运行本插件的设备会导致重复上报**：若其他设备未运行本插件，其保留的 `c < clean_threshold` 行会在每轮「清理前同步」时被合并进来、再次清除并重复上报；只有所有设备均运行本插件才能收敛。
+- **跨设备并发无法真正互斥**：锁文件依赖云盘，两台设备同时清理仍可能互相覆盖快照。
+- **平台验证有限**：仅在 Windows 上实测通过；清理后依赖前端重建会话，macOS / Linux 未经验证；插件无单元测试，CI 仅执行编译。

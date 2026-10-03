@@ -66,7 +66,11 @@ std::string BuildMessage(const UserdbCleanStats &stats, bool full) {
   std::ostringstream msg;
   const int total_removed =
       stats.dict_entries_removed + stats.snapshot_rows_removed;
-  if (total_removed > 0) {
+  if (stats.lock_failed) {
+    msg << "用户词典清理已跳过：另一个清理任务正在运行。\n"
+        << "锁文件：同步目录下的 .userdb_cleaner.lock，超过 10 分钟视为陈锁"
+        << "自动接管。\n耗时：" << stats.elapsed.count() << " 毫秒";
+  } else if (total_removed > 0) {
     msg << "用户词典清理完成。\n"
         << "用户词典：移除 " << stats.dict_entries_removed << " 个词条（"
         << stats.deleted_dicts.size() << " 本）\n"
@@ -79,12 +83,16 @@ std::string BuildMessage(const UserdbCleanStats &stats, bool full) {
         << "未找到需要清理的词条。\n"
         << "耗时：" << stats.elapsed.count() << " 毫秒";
   }
-  msg << "\n重建快照同步：" << (stats.rebuild_sync_ok ? "成功" : "失败")
-      << "，收尾同步：" << (stats.final_sync_ok ? "成功" : "失败");
+  msg << "\n清理前同步：" << (stats.pre_sync_ok ? "成功" : "失败")
+      << "，清理后同步：" << (stats.post_sync_ok ? "成功" : "失败");
+  if (stats.skipped_phrase_rows > 0 || stats.unparsed_rows > 0) {
+    msg << "\n跳过 " << stats.skipped_phrase_rows << " 行 t=0 短语、"
+        << stats.unparsed_rows << " 行无法解析的行（详见日志）";
+  }
   if (full) {
     msg << "\n\n已扫描同步快照：" << stats.snapshots_processed << " 个文件";
-    if (stats.snapshots_renamed > 0)
-      msg << "\n改名备份的旧快照：" << stats.snapshots_renamed << " 个";
+    if (stats.snapshots_backed_up > 0)
+      msg << "\n备份的本机快照：" << stats.snapshots_backed_up << " 个";
     if (!stats.deleted_dicts.empty())
       msg << "\n\n处理的用户词典：\n" << JoinLines(stats.deleted_dicts);
     if (!stats.deleted_files.empty())

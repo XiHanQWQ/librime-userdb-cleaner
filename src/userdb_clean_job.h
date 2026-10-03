@@ -2,6 +2,7 @@
 #define USERDB_CLEAN_JOB_H_
 
 #include <chrono>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -22,14 +23,21 @@ struct UserdbCleanStats {
   int dict_entries_removed = 0;
   int snapshot_rows_removed = 0;
   int snapshots_processed = 0;
-  int snapshots_renamed = 0;
-  // 重建快照同步：旧快照已改名备份，直接由清理后的本地词典导出全新快照
-  bool rebuild_sync_ok = false;
-  // 收尾同步：合并刚清理过的快照并再次导出，确认没有词条被合并回来
-  bool final_sync_ok = false;
+  int snapshots_backed_up = 0;
+  // t = 0 的短语行（table/stabledb，如 custom_phrase）：按 librime 语义不动。
+  int skipped_phrase_rows = 0;
+  // 解析不出 c= 字段的行：保守保留，但要报出来，免得格式变了却静默失效。
+  int unparsed_rows = 0;
+  bool lock_failed = false;
+  // 清理前同步：合并 sync 下所有设备目录的快照进本地词典，再导出本机词典
+  bool pre_sync_ok = false;
+  // 清理后同步：合并已清理的快照并再次导出，保证快照与本地状态一致
+  bool post_sync_ok = false;
   std::vector<std::string> deleted_dicts;
   std::vector<std::string> deleted_files;
+  // 已去重的删除词条：同一个词先被本地物理删、又被快照清理删时只记一次。
   std::vector<std::string> deleted_words;
+  std::set<std::string> recorded_words;
   std::chrono::milliseconds elapsed{0};
 };
 
