@@ -122,7 +122,7 @@ void ShowMessage(const std::string &title, const std::string &message) {
   MultiByteToWideChar(CP_UTF8, 0, message.c_str(), -1, wmessage.data(),
                       wmessage_len);
   MultiByteToWideChar(CP_UTF8, 0, title.c_str(), -1, wtitle.data(), wtitle_len);
-  // 去掉尾部 '\0'，让 wstring 大小与实际字符数一致。
+  // 去除尾部 '\0'，使 wstring 的长度与实际字符数一致。
   wmessage.resize(static_cast<size_t>(wmessage_len - 1));
   wtitle.resize(static_cast<size_t>(wtitle_len - 1));
   MessageBoxW(nullptr, wmessage.c_str(), wtitle.c_str(),

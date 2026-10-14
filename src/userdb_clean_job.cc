@@ -1,4 +1,5 @@
 #include "userdb_clean_job.h"
+#include "userdb_notify.h"
 
 #include <rime/common.h>
 #include <rime/deployer.h>
@@ -20,6 +21,7 @@
 #include <optional>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -32,14 +34,11 @@ constexpr const char kSnapshotSuffix[] = ".userdb.txt";
 constexpr const char kSnapshotTempSuffix[] = ".userdb.txt.tmp";
 constexpr const char kBackupSuffix[] = ".userdb_backup.txt";
 constexpr const char kCleanLogFileName[] = "userdb_cleaner.txt";
-constexpr const char kRolledLogSuffix[] = ".1";
 constexpr const char kLockFileName[] = ".userdb_cleaner.lock";
 constexpr const char kLevelDbClass[] = "userdb";
 constexpr const char kPlainUserdbClass[] = "plain_userdb";
 
-// 日志只增不减，超过这个体积就轮转为 userdb_cleaner.txt.1。
-constexpr std::uintmax_t kMaxLogBytes = 2 * 1024 * 1024;
-// 锁文件超过这个秒数视为陈锁（持有者崩了没人删）。
+// 锁文件超过该秒数未被更新即视为陈锁（持有方异常退出且未清理）。
 constexpr int kLockStaleSeconds = 600;
 
 bool EndsWith(std::string_view text, std::string_view suffix) {
@@ -47,7 +46,7 @@ bool EndsWith(std::string_view text, std::string_view suffix) {
          text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-// 仅当剥离后仍有内容时返回名称；否则返回 nullopt。
+// 剥离后缀；要求剥离后仍有剩余内容，否则返回 nullopt。
 std::optional<string> StripSuffix(std::string_view text,
                                   std::string_view suffix) {
   if (text.size() <= suffix.size() || !EndsWith(text, suffix))
@@ -70,7 +69,7 @@ string LogTimestamp() {
   return buffer;
 }
 
-// UserDbValue::Pack() 的字段（src/rime/dict/user_db.cc:22）：
+// 对应 UserDbValue::Pack() 的字段格式（src/rime/dict/user_db.cc:22）：
 //   "c=2 d=0.744532 t=41664"
 struct DbRowValue {
   int commits = 0;
@@ -110,7 +109,7 @@ DbRowValue ParseDbRowValue(std::string_view value) {
           row.has_tick = true;
         }
       } else if (key == "d") {
-        // 浮点的 from_chars 在部分标准库上还没有，用 strtod。
+        // 部分标准库尚未提供浮点数版本的 from_chars，此处改用 strtod。
         const string text_str(text);
         char *str_end = nullptr;
         const double dee = std::strtod(text_str.c_str(), &str_end);
@@ -126,11 +125,11 @@ DbRowValue ParseDbRowValue(std::string_view value) {
   return row;
 }
 
-// 直接借 librime 自己的可见性判定：UserDictionary::CreateDictEntry 里做了
-// 完整判断——commits < 0、tick == 0 豁免衰减、衰减后 dee <= kDiscardThreshold
-// 等等（src/rime/dict/user_dictionary.cc）。返回空就说明这一行输入法永远
-// 不会再给出。插件因此不需要抄一份 1e-200 或衰减公式，librime 以后调整
-// 判据也自动跟上。
+// 复用 librime 自身的可见性判定：UserDictionary::CreateDictEntry 内部完成了
+// 完整判断——commits < 0（删除标记）、tick == 0 豁免淘汰判定、tick != 0 且
+// 衰减后 dee <= kDiscardThreshold 等（见 src/rime/dict/user_dictionary.cc），
+// 返回空即表示该行不会再作为候选输出。插件因此无需复刻其阈值常量与衰减
+// 公式，librime 后续调整判据时本插件的判定行为自动保持一致。
 bool IsInvisibleToLibrime(std::string_view key, std::string_view value,
                           uint64_t present_tick) {
   return !UserDictionary::CreateDictEntry(string(key), string(value),
@@ -140,48 +139,50 @@ bool IsInvisibleToLibrime(std::string_view key, std::string_view value,
 enum class RowAction {
   keep,
   remove,
-  // t = 0 的短语行（table/stabledb，如 custom_phrase）。
+  // t = 0 的短语行（源自 table/stabledb，如 custom_phrase）。
   skip_phrase,
-  // 解析不出 c/d/t 的行：保守保留，但要让调用方报出来。
+  // 无法解析出 c/d/t 的行：保守保留，并由调用方计数上报。
   unparsed,
 };
 
-// 一行的处置。threshold 与 present_tick 对本地 .userdb 和同步快照必须用同一套
-// 判据，否则本地删了、快照还留着，下一轮同步又会把它合并回来。
+// 单行处置判定。本地 .userdb 与同步快照必须采用同一套判据
+// （threshold 与 present_tick），否则本地删除后快照仍保留该行，
+// 下一轮同步又会将词条合并回来。
 RowAction ClassifyRow(std::string_view key, std::string_view value,
                       int threshold, uint64_t present_tick) {
   const DbRowValue row = ParseDbRowValue(value);
-  // c/d/t 缺一个就不敢按 librime 的判据下结论（它的 Unpack 同样会失败），
+  // c/d/t 缺失时无法套用 librime 的判据（其 Unpack 同样会失败），
   // 保守保留并计数上报。
   if (!row.has_commits || !row.has_dee || !row.has_tick)
     return RowAction::unparsed;
-  // tick == 0 是从 table/stabledb 导入的短语（如 custom_phrase）：
-  // librime 对它们从不做衰减淘汰，这里也一律不动。
+  // tick == 0 表示从 table/stabledb 导入的短语（如 custom_phrase）：
+  // librime 对这类行从不执行衰减淘汰，此处同样一律保留。
   if (row.tick == 0)
     return RowAction::skip_phrase;
   if (row.commits < threshold)
     return RowAction::remove;
-  // c 看不出"用不用"时，用 librime 自己的判定兜底：它认为已经不可见的行
-  // （c 可能还 >= threshold）同样清掉。
+  // c 不足以判定时，以 librime 自身的可见性判定兜底：已被 librime 判定为
+  // 不可见的行（c 可能仍 >= threshold）同样删除。
   if (IsInvisibleToLibrime(key, value, present_tick))
     return RowAction::remove;
   return RowAction::keep;
 }
 
-// 快照行 key 与 value 之间用制表符分隔，词条名在第一个制表符之后。
+// 快照行的 key 与 value 以制表符分隔，词条名位于第一个制表符之后。
 string WordFromKey(std::string_view key) {
   const size_t tab = key.find('\t');
   return tab == std::string_view::npos ? string(key) : string(key.substr(tab + 1));
 }
 
-// 去重：同一个词可能先被本地物理删、又被快照清理删一次（本机快照里那份）。
+// 去重记录：同一词条可能先经本地物理删除、又经快照清理再删一次
+// （本机快照内的一份），只统计一次。
 void RecordDeletedWord(UserdbCleanStats *stats, string word) {
   if (stats->recorded_words.insert(word).second)
     stats->deleted_words.push_back(std::move(word));
 }
 
-// 黑名单模式：exclude_userdb_list 中的词典会被跳过，其余全部清理。
-// 列表为空时表示清理所有词典。
+// 排除名单判定：名单中的词典被跳过，其余词典全部清理。
+// 名单为空时表示清理所有词典。
 bool ShouldClean(const string &dict_name, const UserdbCleanOptions &options) {
   if (options.exclude_userdb_list.empty())
     return true;
@@ -195,7 +196,7 @@ struct LocalUserdb {
   string db_class;
 };
 
-// 本地词典有两种落盘形式（src/rime/dict/dict_module.cc:30-31）：
+// 本地词典有两种落盘形式（见 src/rime/dict/dict_module.cc:30-31）：
 //   userdb       → <name>.userdb 目录（LevelDb，默认）
 //   plain_userdb → <name>.userdb.txt 文件（TextDb）
 vector<LocalUserdb> FindLocalUserdbs(const path &user_data_dir) {
@@ -232,19 +233,19 @@ path ResolveSyncDir() {
   return deployer.user_data_dir / "sync";
 }
 
-// 进程内同步：合并 sync 目录中其他设备的快照 + 导出本机词典。
-// IME 进程默认只加载 kDefaultModules（core/dict/gears），
-// 而 user_dict_sync 任务注册在 levers 模块里，需先补齐加载。
+// 进程内同步：合并 sync 目录下其他设备的快照，并导出本机词典。
+// IME 进程默认仅加载 kDefaultModules（core/dict/gears），而 user_dict_sync
+// 任务注册于 levers 模块，需先补齐模块加载。
 bool RunUserDictSync() {
   LoadModules(kDeployerModules);
-  // 活动会话的 UserDictionary 强持有 .userdb 句柄，而 UserDictManager
-  // 会另建句柄去 Open——Windows 下 LevelDb LOCK 互斥，不清会话则同步
-  // 必然失败（日志表现为 "LOCK: 另一个程序正在使用此文件"）。
-  // 与官方 RimeSyncUserData 一致：先关闭所有会话，前端随后自动重建。
+  // 活动会话的 UserDictionary 持有 .userdb 句柄，而 UserDictManager 会
+  // 另行创建句柄执行 Open：Windows 上 LevelDb 的 LOCK 互斥，若不先清理
+  // 会话，同步必然失败（日志表现为 "LOCK: 另一个程序正在使用此文件"）。
+  // 与官方 RimeSyncUserData 保持一致：先关闭所有会话，由前端随后重建。
   Service::instance().CleanupAllSessions();
   Deployer &deployer = Service::instance().deployer();
-  // installation_update 负责读取 installation.yaml 恢复 user_id，
-  // 否则快照会写到 sync_dir 根目录，与既有安装目录对不上。
+  // installation_update 负责读取 installation.yaml 并恢复 user_id；
+  // 否则快照会写入 sync_dir 根目录，无法与既有安装目录对应。
   const bool ok_install = deployer.RunTask("installation_update");
   const bool ok_sync = deployer.RunTask("user_dict_sync");
   if (!ok_install || !ok_sync) {
@@ -255,13 +256,20 @@ bool RunUserDictSync() {
   return ok_install && ok_sync;
 }
 
-// 打开本地词典。活动会话强持有 .userdb 句柄（LevelDb 的 LOCK 文件互斥），
-// 打不开时再关闭所有会话重试一次——不然每轮清理都要白打断一次输入。
+// 打开本地词典。正常情况下维护线程上已无活动会话，首次尝试即可打开；
+// 若触发按键事件的收尾尚未结束（对应会话的 LOCK 尚未释放），则清理会话
+// 并稍候重试。维护线程上不存在 RimeProcessKey 的栈引用，此处的
+// CleanupAllSessions 能够真正销毁残留会话。
 bool OpenUserdb(an<Db> &db) {
-  if (db->Open())
-    return true;
-  Service::instance().CleanupAllSessions();
-  return db->Open();
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    if (attempt > 0) {
+      Service::instance().CleanupAllSessions();
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (db->Open())
+      return true;
+  }
+  return false;
 }
 
 bool ReadTick(Db *db, uint64_t *tick) {
@@ -277,15 +285,15 @@ bool ReadTick(Db *db, uint64_t *tick) {
   return true;
 }
 
-// 流程第③步：物理删除本地词典里的无用词条，并把每个词典的 /tick 记进
-// tick_map，供第④步清理快照时用同一个 present_tick 判定。
+// 流程第 ③ 步：物理删除本地词典中的无用词条，并将各词典的 /tick 记入
+// tick_map，供第 ④ 步清理快照时使用同一 present_tick 判定。
 //
-// librime 的「删除」只是把 c 写成负值（墓碑行），它靠墓碑行跨设备传播删除；
-// 但同步是全量导出（UniformBackup 原样遍历本地 LevelDb），墓碑行会被原封
-// 写进 *.userdb.txt，于是清理完快照后下一次同步又把它导回来——每次都重复
-// 上报同一批词、文件里却始终还在。要真正删干净只能本地物理 Erase：
-// 本地没墓碑 → 导不出 → 快照没有 → 只报一次。
-// 代价：没有墓碑行后，其他设备同步来的同名词条会复活（下次再删）；
+// librime 的「删除」仅将 c 写为负值（墓碑行），并依赖墓碑行跨设备传播删除；
+// 但同步为全量导出（UniformBackup 原样遍历本地 LevelDb），墓碑行会被原样
+// 写入 *.userdb.txt——清理完快照后下一次同步又将其导回，同一批词条每轮
+// 重复上报，且文件中始终残留。要彻底删除只能对本地执行物理 Erase：
+// 本地无墓碑 → 导出不含 → 快照不含 → 仅上报一次。
+// 代价：失去墓碑行后，其他设备同步来的同名词条会复活（下次再删），
 // 跨设备的删除传播失效。
 void CleanLiveUserdbs(const UserdbCleanOptions &options,
                       UserdbCleanStats *stats,
@@ -315,7 +323,7 @@ void CleanLiveUserdbs(const UserdbCleanOptions &options,
     const bool have_tick = ReadTick(db.get(), &present_tick);
     if (have_tick)
       (*tick_map)[entry.name] = present_tick;
-    // 先收集再删除：QueryAll 的游标遍历期间不改动 db。
+    // 先收集后删除：避免在 QueryAll 游标遍历期间修改数据库。
     vector<string> doomed_keys;
     vector<string> doomed_words;
     {
@@ -348,7 +356,7 @@ void CleanLiveUserdbs(const UserdbCleanOptions &options,
       const string &key = doomed_keys[i];
       if (db->Erase(key)) {
         ++removed;
-        // 日志里逐条打印删掉的词条（连同完整 key：码 + 词），方便核对。
+        // 在日志中逐条记录被删除的词条（含完整 key：码 + 词），便于核对。
         LOG(INFO) << "userdb cleaner: erased '" << doomed_words[i] << "' from '"
                   << entry.name << "' (" << key << ").";
       } else {
@@ -368,7 +376,7 @@ void CleanLiveUserdbs(const UserdbCleanOptions &options,
   }
 }
 
-// 快照头部 "#@/tick\t41822"。
+// 快照头部格式："#@/tick\t41822"。
 std::optional<uint64_t> ParseSnapshotTick(std::string_view line) {
   constexpr std::string_view kPrefix = "#@/tick";
   if (line.size() <= kPrefix.size() ||
@@ -391,7 +399,7 @@ RowAction ClassifySnapshotLine(std::string_view raw_line, int threshold,
   std::string_view line = raw_line;
   if (!line.empty() && line.back() == '\r')
     line.remove_suffix(1);
-  // 空行与 "#" 开头的是文件头/元数据，一律保留。
+  // 空行与以 "#" 开头的行属于文件头/元数据，一律保留。
   if (line.empty() || line[0] == '#')
     return RowAction::keep;
   const size_t first_tab = line.find('\t');
@@ -408,13 +416,15 @@ RowAction ClassifySnapshotLine(std::string_view raw_line, int threshold,
   return action;
 }
 
-// 流程第④步：清理一份快照文件。local_tick / has_local_tick 是本机该词典的
-// /tick：两边必须用同一个 present_tick 判定，否则本地删了、快照还留着。
-// 没有本机 tick（词典打不开或没做过同步）时退回文件头里的 #@/tick。
+// 流程第 ④ 步：清理单个快照文件。local_tick / has_local_tick 为本机该词典
+// 的 /tick：本地与快照必须使用同一 present_tick 判定，否则本地删除后快照
+// 仍保留该行。本机 tick 不可得（词典无法打开或从未同步）时，回退使用
+// 快照文件头中的 #@/tick。
 void CleanSnapshotFile(const path &file, const UserdbCleanOptions &options,
                        uint64_t local_tick, bool has_local_tick,
                        UserdbCleanStats *stats) {
-  // MinGW 上 rime::path 不是 std::filesystem::path，统一走 UTF-8 字符串。
+  // MinGW 下 rime::path 并非 std::filesystem::path，统一经由 UTF-8 字符串
+  // 访问文件。
   std::ifstream in(file.to_utf8_string(), std::ios::binary);
   if (!in.is_open()) {
     LOG(ERROR) << "userdb cleaner: cannot open snapshot file: " << file;
@@ -422,7 +432,7 @@ void CleanSnapshotFile(const path &file, const UserdbCleanOptions &options,
   }
 
   const string filename = file.filename().to_utf8_string();
-  // 边读边写到临时文件，避免把整个快照缓冲在内存里。
+  // 流式读写临时文件，避免将整个快照缓冲在内存中。
   path temp(file);
   temp += path(kSnapshotTempSuffix);
   std::ofstream out(temp.to_utf8_string(), std::ios::binary | std::ios::trunc);
@@ -483,7 +493,7 @@ void CleanSnapshotFile(const path &file, const UserdbCleanOptions &options,
     return;
   }
 
-  // 备份由流程第②步完成（只备份本机那份），这里直接原子替换。
+  // 备份由流程第 ② 步完成（仅备份本机快照），此处直接执行原子替换。
   std::filesystem::rename(temp, file, ec);
   if (ec) {
     LOG(ERROR) << "userdb cleaner: cannot replace " << file << ": "
@@ -518,7 +528,7 @@ void CleanSnapshots(const path &sync_dir, const UserdbCleanOptions &options,
       continue;
     const path file(it->path());
     const string filename = file.filename().to_utf8_string();
-    // 上次崩溃/中断留下的临时文件，顺手清掉（云盘同步目录里最容易堆积）。
+    // 清除上次运行崩溃或中断残留的临时文件（云盘同步目录中最易堆积）。
     if (EndsWith(filename, kSnapshotTempSuffix)) {
       std::error_code remove_ec;
       std::filesystem::remove(file, remove_ec);
@@ -540,9 +550,10 @@ void CleanSnapshots(const path &sync_dir, const UserdbCleanOptions &options,
   }
 }
 
-// 流程第②步：把本机那份快照复制一份为 *.userdb_backup.txt（同名覆盖旧备份）。
-// 只复制、不移动：本机快照留在原地，收尾同步还要用；
-// 也只备份本机设备目录——其他设备的快照由它们自己备份，不往人家目录里写文件。
+// 流程第 ② 步：将本机快照复制为 *.userdb_backup.txt（同名覆盖旧备份）。
+// 仅复制、不移动：本机快照保留在原位，收尾同步仍需使用；
+// 且仅备份本机设备目录——其他设备的快照由其自身负责，不向其他设备
+// 目录写入文件。
 void BackupSnapshots(const path &own_sync_dir,
                      const UserdbCleanOptions &options,
                      UserdbCleanStats *stats) {
@@ -581,31 +592,19 @@ void BackupSnapshots(const path &own_sync_dir,
   }
 }
 
-// 日志只增不减：超过 kMaxLogBytes 就轮转一代为 userdb_cleaner.txt.1。
-void RotateCleanLog(const path &log_file) {
-  std::error_code ec;
-  const std::uintmax_t size = std::filesystem::file_size(log_file, ec);
-  if (ec || size <= kMaxLogBytes)
-    return;
-  path rolled(log_file);
-  rolled += path(kRolledLogSuffix);
-  std::filesystem::remove(rolled, ec);
-  std::filesystem::rename(log_file, rolled, ec);
-}
-
+// 日志文件只追加不截断，不设体积上限与轮转。
 void AppendCleanLog(const path &sync_dir, const UserdbCleanOptions &options,
                     const UserdbCleanStats &stats) {
   const bool nothing_changed = stats.dict_entries_removed == 0 &&
                                stats.snapshot_rows_removed == 0 &&
                                stats.snapshots_backed_up == 0;
-  // 什么都没动、且两次同步都成功就不用记一笔。
+  // 未产生任何变更且两次同步均成功时不记录。
   if (nothing_changed && stats.pre_sync_ok && stats.post_sync_ok)
     return;
   std::error_code ec;
   if (sync_dir.empty() || !std::filesystem::is_directory(sync_dir, ec))
     return;
   const path log_file = sync_dir / path(kCleanLogFileName);
-  RotateCleanLog(log_file);
   std::ofstream out(log_file.to_utf8_string(), std::ios::app);
   if (!out.is_open()) {
     LOG(ERROR) << "userdb cleaner: cannot open log file: " << log_file;
@@ -630,8 +629,8 @@ void AppendCleanLog(const path &sync_dir, const UserdbCleanOptions &options,
   out << "\n\n";
 }
 
-// 删锁用的 RAII 壳子。不能把析构放进返回锁路径的函数里：那样临时对象一析构
-// 就把刚拿到的锁删了。
+// 负责删除锁文件的 RAII 封装。析构不得内联在返回锁路径的函数中：
+// 临时对象析构会立即删除刚获取的锁。
 struct LockGuard {
   path file;
   ~LockGuard() {
@@ -646,14 +645,14 @@ bool LockIsStale(const path &lock_file) {
   std::error_code ec;
   const auto last = std::filesystem::last_write_time(lock_file, ec);
   if (ec)
-    return false;  // 读不到时间就当它还有效，别抢别人的锁
+    return false;  // 无法读取时间戳时按锁仍有效处理，不抢占他人的锁。
   return std::filesystem::file_time_type::clock::now() - last >
          std::chrono::seconds(kLockStaleSeconds);
 }
 
-// 尽力而为的运行锁：同一个 sync 目录同时只跑一个清理任务。
-// 云盘同步有延迟、mtime 也不一定保留，所以跨设备并不能真正互斥，只是尽量
-// 避免两端同时改写同一批快照。拿不到锁时返回空 path。
+// 尽力而为的运行锁：同一 sync 目录同时只允许一个清理任务运行。
+// 云盘同步存在延迟、mtime 也未必保留，因此跨设备无法实现真正互斥，
+// 仅用于尽量避免两端同时改写同一批快照。获取失败时返回空 path。
 path AcquireCleanLock(const path &sync_dir) {
   std::error_code ec;
   if (sync_dir.empty() || !std::filesystem::is_directory(sync_dir, ec))
@@ -669,7 +668,7 @@ path AcquireCleanLock(const path &sync_dir) {
   }
   std::ofstream out(lock_file.to_utf8_string(), std::ios::trunc);
   if (!out.is_open()) {
-    // 写不了锁文件就不锁了，不影响清理本身。
+    // 无法写入锁文件时放弃互斥，不影响清理本身。
     LOG(WARNING) << "userdb cleaner: cannot write lock file " << lock_file;
     return {};
   }
@@ -678,13 +677,23 @@ path AcquireCleanLock(const path &sync_dir) {
   return lock_file;
 }
 
+// 结果弹窗为模态对话框，在独立线程中显示，避免阻塞维护工作线程：
+// "deploy success" 通知须待任务返回后才会发出，不应被弹窗延迟。
+void NotifyCleanResult(const UserdbCleanStats &stats,
+                       const UserdbCleanOptions &opts) {
+  const bool full_display = opts.full_information_display;
+  std::thread([stats, full_display]() {
+    NotifyUserdbCleanResult(stats, full_display);
+  }).detach();
+}
+
 } // namespace
 
-UserdbCleanStats RunUserdbClean(const UserdbCleanOptions &options) {
+bool UserdbCleanTask::Run(Deployer *) {
   const auto started = std::chrono::steady_clock::now();
   UserdbCleanStats stats;
-  UserdbCleanOptions opts = options;
-  // 统一把列表项里可能带上的后缀剥掉。
+  UserdbCleanOptions opts = options_;
+  // 统一剥离名单项中可能携带的后缀。
   for (string &name : opts.exclude_userdb_list) {
     if (auto stripped = StripSuffix(name, kSnapshotSuffix))
       name = std::move(*stripped);
@@ -692,24 +701,36 @@ UserdbCleanStats RunUserdbClean(const UserdbCleanOptions &options) {
       name = std::move(*stripped);
   }
 
-  // 拿运行锁，拿不到就跳过这一轮。
+  // 获取运行锁；获取失败则跳过本轮。
   LockGuard lock;
   lock.file = AcquireCleanLock(ResolveSyncDir());
   if (lock.file.empty()) {
     stats.lock_failed = true;
     stats.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started);
-    return stats;
+    NotifyCleanResult(stats, opts);
+    return false;
   }
 
-  // 顺序：先把各设备的词条同步合并进来，再两边一起清（本地 .userdb +
-  // sync 下所有 *.userdb.txt），最后导出一份干净的快照收尾。
-  // ① 清理前同步：合并 sync 下所有设备目录的快照 → ② 备份本机快照（复制）
-  //  → ③ 物理删本地无用词条 → ④ 清理所有 *.userdb.txt 的残留行
-  //  → ⑤ 清理后同步：再导出一次收尾
-  stats.pre_sync_ok = RunUserDictSync();
-  // sync_dir / user_id 要等 installation_update 跑过才可信：
-  // 进程刚起来时 Deployer 里这两个字段可能还是空的。
+  // 处理顺序：先合并各设备的词条，再两侧同时清理（本地 .userdb 与
+  // sync 目录下所有 *.userdb.txt），最后导出干净快照收尾。
+  // ① 清理前同步：合并 sync 目录下所有设备快照 → ② 备份本机快照（复制）
+  //  → ③ 物理删除本地无用词条 → ④ 清理所有 *.userdb.txt 中的残留行
+  //  → ⑤ 清理后同步：再次导出收尾。
+  // 触发按键事件的收尾可能尚未结束：触发会话由 RimeProcessKey 调用栈上的
+  // shared_ptr 持有，其 .userdb LOCK 需待事件返回后才会释放。维护线程上
+  // 不存在栈引用，此处的 CleanupAllSessions 可真正生效；先短暂等待，
+  // 同步失败则重试。
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  for (int attempt = 0;;) {
+    Service::instance().CleanupAllSessions();
+    stats.pre_sync_ok = RunUserDictSync();
+    if (stats.pre_sync_ok || ++attempt >= 3)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  // sync_dir / user_id 需待 installation_update 执行后才有意义：
+  // 进程启动初期 Deployer 中这两个字段可能仍为空。
   const path sync_dir = ResolveSyncDir();
   BackupSnapshots(Service::instance().deployer().user_data_sync_dir(), opts,
                   &stats);
@@ -731,7 +752,8 @@ UserdbCleanStats RunUserdbClean(const UserdbCleanOptions &options) {
             << " unparsed row(s) in " << stats.elapsed.count()
             << " ms; pre-sync " << (stats.pre_sync_ok ? "ok" : "failed")
             << ", post-sync " << (stats.post_sync_ok ? "ok" : "failed") << ".";
-  return stats;
+  NotifyCleanResult(stats, opts);
+  return stats.pre_sync_ok && stats.post_sync_ok && !stats.lock_failed;
 }
 
 } // namespace rime

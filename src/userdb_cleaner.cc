@@ -3,27 +3,16 @@
 #include <rime/common.h>
 #include <rime/config.h>
 #include <rime/context.h>
+#include <rime/deployer.h>
 #include <rime/engine.h>
 #include <rime/schema.h>
+#include <rime/service.h>
 
-#include <atomic>
-#include <thread>
 #include <utility>
 
 #include "userdb_clean_job.h"
-#include "userdb_notify.h"
 
 namespace rime {
-
-namespace {
-
-std::atomic<bool> g_cleaning{false};
-
-struct CleaningGuard {
-  ~CleaningGuard() { g_cleaning.store(false, std::memory_order_release); }
-};
-
-} // namespace
 
 UserdbCleaner::UserdbCleaner(const Ticket &ticket) : Processor(ticket) {
   InitializeConfig();
@@ -70,21 +59,20 @@ ProcessResult UserdbCleaner::ProcessKeyEvent(const KeyEvent &) {
   options.clean_threshold = clean_threshold_;
   options.full_information_display = full_information_display_;
 
-  if (g_cleaning.exchange(true, std::memory_order_acq_rel)) {
-    LOG(WARNING) << "userdb cleaner: a previous run is still in progress.";
-    return kAccepted;
-  }
-
-  std::thread([options]() {
-    UserdbCleanStats stats;
-    {
-      // 清理阶段持有 guard；通知阶段不再占用标志，
-      // 这样弹窗/zenity 等待不会阻塞下一次触发。
-      CleaningGuard guard;
-      stats = RunUserdbClean(options);
-    }
-    NotifyUserdbCleanResult(stats, options.full_information_display);
-  }).detach();
+  // 调度方式与官方 RimeSyncUserData（src/rime_api_impl.h）保持一致：
+  // 清空会话、将清理任务排入 Deployer 队列、进入维护模式。
+  // 清理不得在按键事件内同步执行：触发会话由 RimeProcessKey 调用栈上的
+  // shared_ptr 持有，只要该调用链尚未返回，会话持有的 .userdb 文件锁
+  // 就无法释放，user_dict_sync 将因 LevelDB 文件锁冲突而全部失败；
+  // 维护工作线程上不存在该栈引用，会话及其文件锁才能被真正释放。
+  // 维护模式期间 Service::disabled() 使全部会话 API 安全失效（按键直接
+  // 透传，前端不会访问已销毁的会话）；任务完成后 Deployer 发出
+  // "deploy success" 通知，前端据此重建会话。清理逻辑见 UserdbCleanTask::Run。
+  Deployer &deployer = Service::instance().deployer();
+  Service::instance().CleanupAllSessions();
+  deployer.ScheduleTask(New<UserdbCleanTask>(options));
+  if (!deployer.StartMaintenance())
+    LOG(INFO) << "userdb cleaner: task queued behind running maintenance.";
   return kAccepted;
 }
 

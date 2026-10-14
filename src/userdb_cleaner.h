@@ -19,7 +19,7 @@ private:
   void InitializeConfig();
 
   std::string trigger_input_ = "/del";
-  // 黑名单：不参与清理的词典名。为空表示清理全部。
+  // 排除名单：名单中的用户词典不参与清理；名单为空时清理全部词典。
   std::vector<std::string> exclude_userdb_list_;
   bool full_information_display_ = false;
   int clean_threshold_ = 0;
