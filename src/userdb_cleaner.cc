@@ -30,6 +30,8 @@ void UserdbCleaner::InitializeConfig() {
   config->GetBool("userdb_cleaner/full_information_display",
                   &full_information_display_);
   config->GetInt("userdb_cleaner/clean_threshold", &clean_threshold_);
+  config->GetBool("userdb_cleaner/use_custom_threshold",
+                  &use_custom_threshold_);
   if (auto list = config->GetList("userdb_cleaner/exclude_userdb_list")) {
     exclude_userdb_list_.clear();
     for (size_t i = 0; i < list->size(); ++i) {
@@ -42,6 +44,7 @@ void UserdbCleaner::InitializeConfig() {
   }
   LOG(INFO) << "userdb cleaner: trigger '" << trigger_input_
             << "', clean_threshold " << clean_threshold_
+            << ", use_custom_threshold " << use_custom_threshold_
             << ", full_information_display " << full_information_display_
             << ", userdb blacklist has " << exclude_userdb_list_.size()
             << " item(s).";
@@ -57,6 +60,7 @@ ProcessResult UserdbCleaner::ProcessKeyEvent(const KeyEvent &) {
   UserdbCleanOptions options;
   options.exclude_userdb_list = exclude_userdb_list_;
   options.clean_threshold = clean_threshold_;
+  options.use_custom_threshold = use_custom_threshold_;
   options.full_information_display = full_information_display_;
 
   // 调度方式与官方 RimeSyncUserData（src/rime_api_impl.h）保持一致：

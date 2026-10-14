@@ -23,6 +23,8 @@ private:
   std::vector<std::string> exclude_userdb_list_;
   bool full_information_display_ = false;
   int clean_threshold_ = 0;
+  // 自定义 c 值废词判据（c < clean_threshold）的开关，默认不启用。
+  bool use_custom_threshold_ = false;
 };
 
 } // namespace rime

@@ -16,7 +16,7 @@
 
 共两条判据，**本地词典与所有快照文件使用同一套**（否则本地删除后快照仍保留，下一轮同步又会将词条合并回来）：
 
-1. **`c < clean_threshold`**：`c` 为提交次数。比较为**严格小于**，默认 `0` 仅删除 `c` 为负的删除标记行；设为 `1` 则连从未使用过的 `c = 0` 行一并删除。
+1. **`c < clean_threshold`**（自定义判据，由 `use_custom_threshold` 控制，默认**不启用**）：`c` 为提交次数。比较为**严格小于**，默认 `0` 仅删除 `c` 为负的删除标记行；设为 `1` 则连从未使用过的 `c = 0` 行一并删除。`use_custom_threshold` 为 `false`（默认）时本判据整体关闭，仅使用第 2 条 librime 内部判据。
 2. **librime 判定为不可见的行**：调用 `UserDictionary::CreateDictEntry(key, value, present_tick)`，返回空即说明输入法不会再给出该行，无论 `c` 多大都会删除（其内部包含 `commits < 0`、衰减后 `dee <= kDiscardThreshold` 等全部条件）。判定使用的 `present_tick` 取本机该词典的 `/tick`；本地词典无法打开时回退使用快照文件头中的 `#@/tick`。
 
 两类行**不受判据影响**：
@@ -49,6 +49,7 @@ engine/processors:
 userdb_cleaner:
   trigger_input: "/clean"               # 触发清理的输入串，默认 "/del"
   clean_threshold: 1                    # 删除条件：c < clean_threshold，默认 0
+  use_custom_threshold: true            # 是否启用自定义 c 值判据，默认 false
   full_information_display: true        # 弹窗是否显示详细信息，默认 false
   exclude_userdb_list: []               # 排除名单：不参与清理的词典，空 = 全部清理
 ```
@@ -65,7 +66,8 @@ userdb_cleaner:
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `trigger_input` | 字符串 | `"/del"` | 输入该串后触发清理；设为空字符串则永不触发 |
-| `clean_threshold` | 整数 | `0` | 删除条件 `c < clean_threshold`；此外无论阈值如何，librime 判定为不可见的行同样会被删除。`t = 0` 的短语行一律保留，无法解析出 `c/d/t` 的行一律保留并计数上报 |
+| `clean_threshold` | 整数 | `0` | 删除条件 `c < clean_threshold`，仅当 `use_custom_threshold` 为 `true` 时生效 |
+| `use_custom_threshold` | 布尔 | `false` | 是否启用自定义 c 值废词判据（`c < clean_threshold`）。`false`（默认）时仅使用 librime 内部判据，librime 判定为不可见的行仍会被删除；`t = 0` 的短语行与无法解析出 `c/d/t` 的行在任何开关状态下都一律保留 |
 | `full_information_display` | 布尔 | `false` | `false` 仅显示统计；`true` 额外显示扫描 / 备份数量、处理的词典与文件、删除的词条（最多 10 条，并标出总条数） |
 | `exclude_userdb_list` | 字符串数组 | 空（全部清理） | **排除名单**：不参与清理的词典名，可带或不带 `.userdb` / `.userdb.txt` 后缀。该名单同时作用于本地清理、快照备份与快照清理；名单内词典的快照既不备份也不清理，但同步合并照常进行 |
 

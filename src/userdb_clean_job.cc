@@ -149,7 +149,8 @@ enum class RowAction {
 // （threshold 与 present_tick），否则本地删除后快照仍保留该行，
 // 下一轮同步又会将词条合并回来。
 RowAction ClassifyRow(std::string_view key, std::string_view value,
-                      int threshold, uint64_t present_tick) {
+                      int threshold, bool use_custom_threshold,
+                      uint64_t present_tick) {
   const DbRowValue row = ParseDbRowValue(value);
   // c/d/t 缺失时无法套用 librime 的判据（其 Unpack 同样会失败），
   // 保守保留并计数上报。
@@ -159,7 +160,9 @@ RowAction ClassifyRow(std::string_view key, std::string_view value,
   // librime 对这类行从不执行衰减淘汰，此处同样一律保留。
   if (row.tick == 0)
     return RowAction::skip_phrase;
-  if (row.commits < threshold)
+  // 自定义判据 c < threshold 仅在开关启用时生效；未启用时只使用
+  // librime 内部的可见性判定。
+  if (use_custom_threshold && row.commits < threshold)
     return RowAction::remove;
   // c 不足以判定时，以 librime 自身的可见性判定兜底：已被 librime 判定为
   // 不可见的行（c 可能仍 >= threshold）同样删除。
@@ -331,7 +334,7 @@ void CleanLiveUserdbs(const UserdbCleanOptions &options,
       string key, value;
       while (accessor && accessor->GetNextRecord(&key, &value)) {
         switch (ClassifyRow(key, value, options.clean_threshold,
-                            present_tick)) {
+                            options.use_custom_threshold, present_tick)) {
           case RowAction::remove:
             doomed_keys.push_back(key);
             doomed_words.push_back(WordFromKey(key));
@@ -395,7 +398,8 @@ std::optional<uint64_t> ParseSnapshotTick(std::string_view line) {
 }
 
 RowAction ClassifySnapshotLine(std::string_view raw_line, int threshold,
-                               uint64_t present_tick, string *word) {
+                               bool use_custom_threshold, uint64_t present_tick,
+                               string *word) {
   std::string_view line = raw_line;
   if (!line.empty() && line.back() == '\r')
     line.remove_suffix(1);
@@ -410,7 +414,7 @@ RowAction ClassifySnapshotLine(std::string_view raw_line, int threshold,
     return RowAction::keep;
   const RowAction action = ClassifyRow(line.substr(0, second_tab),
                                        line.substr(second_tab + 1), threshold,
-                                       present_tick);
+                                       use_custom_threshold, present_tick);
   if (action == RowAction::remove && word)
     *word = string(line.substr(first_tab + 1, second_tab - first_tab - 1));
   return action;
@@ -454,7 +458,8 @@ void CleanSnapshotFile(const path &file, const UserdbCleanOptions &options,
       }
     }
     string word;
-    switch (ClassifySnapshotLine(line, options.clean_threshold, present_tick,
+    switch (ClassifySnapshotLine(line, options.clean_threshold,
+                                 options.use_custom_threshold, present_tick,
                                  &word)) {
       case RowAction::remove:
         ++removed;

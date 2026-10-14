@@ -18,6 +18,9 @@ struct UserdbCleanOptions {
   // 名单为空时表示清理所有词典。
   std::vector<std::string> exclude_userdb_list;
   int clean_threshold = 0;
+  // 自定义 c 值废词判据（c < clean_threshold）的开关：false 时仅使用
+  // librime 内部判据（UserDictionary::CreateDictEntry 可见性判定）。
+  bool use_custom_threshold = false;
   bool full_information_display = false;
 };
 
